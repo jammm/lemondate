@@ -43,6 +43,14 @@ PTT_AUTO_SUBMIT = os.environ.get("PTT_AUTO_SUBMIT", "1").lower() not in (
     "0", "off", "false", "no", "",
 )
 
+# On F9 press, seed the recorder with the last N ms of audio the wake
+# listener has been rolling through its always-on InputStream. Without
+# this, anything you said in the ~150-300 ms window between deciding to
+# press F9 and your finger actually landing on the key is lost, and fast
+# short utterances (a single word, under half a second) can miss the
+# start entirely.
+PTT_PREBUFFER_MS = int(os.environ.get("PTT_PREBUFFER_MS", "500"))
+
 # Wake-word detection works by reusing Whisper itself — every energy-gated
 # speech burst gets transcribed, and if the transcription matches
 # WAKE_PHRASE at the start, we strip the match and type the remainder

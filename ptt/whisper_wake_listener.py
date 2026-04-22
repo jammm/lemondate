@@ -23,6 +23,7 @@ flip the recorder on.
 
 from __future__ import annotations
 
+import collections
 import logging
 import threading
 import time
@@ -39,13 +40,51 @@ class WhisperWakeListener:
     """Energy-gated wake detector. Monitors the mic, and on each burst
     of speech kicks off a recorder capture with source="whisper_wake" —
     the recorder then transcribes via Lemonade/Whisper and types the
-    result only if the transcript starts with WAKE_PHRASE."""
+    result only if the transcript starts with WAKE_PHRASE.
+
+    Also acts as the sole owner of the shared microphone stream. The
+    F9 PTT path reuses this stream instead of opening its own (Windows
+    WASAPI doesn't cope well with two concurrent InputStreams on the
+    same device — duplicate frames leak through to the recorder and
+    garble the transcript). PTT grabs `get_prebuffer()` on keydown to
+    capture audio that preceded the keypress, then relies on this
+    class's main loop to keep feeding frames while `recorder.is_-
+    recording()` is true.
+    """
 
     def __init__(self, recorder, stop_event: threading.Event):
         self.recorder = recorder
         self.stop_event = stop_event
         self._thread: threading.Thread | None = None
         self._last_fire = 0.0
+        # Rolling window of recent input frames for PTT prebuffer. Size
+        # is configured in ms; deque drops the oldest frame once full.
+        frame_ms = config.CHUNK_SAMPLES * 1000 / config.SAMPLE_RATE
+        n_frames = max(1, int(config.PTT_PREBUFFER_MS / frame_ms) + 1)
+        self._prebuffer: collections.deque = collections.deque(maxlen=n_frames)
+        self._prebuffer_lock = threading.Lock()
+
+    def get_prebuffer(self) -> np.ndarray | None:
+        """Return a concatenated snapshot of the rolling prebuffer, or
+        None if the listener hasn't accumulated any frames yet (e.g.
+        if it just started). Returned array is a copy — safe to feed
+        into the recorder without worrying about the deque mutating
+        underneath us."""
+        with self._prebuffer_lock:
+            if not self._prebuffer:
+                return None
+            return np.concatenate(list(self._prebuffer)).astype(
+                np.int16, copy=False,
+            )
+
+    def note_external_fire(self) -> None:
+        """Tell the wake listener that some other path (PTT) just
+        started a recording. Bumps `_last_fire` so the WAKE_COOLDOWN
+        check suppresses a wake trigger on the tail of the PTT
+        utterance (otherwise, releasing F9 and then exhaling loudly
+        can satisfy the energy gate with stale audio from the same
+        input session)."""
+        self._last_fire = time.monotonic()
 
     def start(self) -> None:
         self._thread = threading.Thread(
@@ -74,6 +113,13 @@ class WhisperWakeListener:
                     if overflowed:
                         log.debug("whisper wake stream overflow")
                     frame = frame.flatten()
+
+                    # Always update the rolling prebuffer so F9 can
+                    # grab the last ~500 ms on keydown. Copy because
+                    # sounddevice reuses the underlying buffer on the
+                    # next read() call.
+                    with self._prebuffer_lock:
+                        self._prebuffer.append(frame.copy())
 
                     # If a recording is already in progress (this
                     # listener kicked one, or F9 is held), just feed it.

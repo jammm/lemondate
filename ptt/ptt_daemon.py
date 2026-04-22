@@ -37,12 +37,32 @@ log = logging.getLogger("ptt")
 
 
 class PTTKeyHandler:
-    """Global F9 press-and-hold. Opens its own InputStream while held."""
+    """Global F9 press-and-hold.
 
-    def __init__(self, recorder: Recorder, stop_event: threading.Event):
+    If a WhisperWakeListener is running, PTT piggybacks on its mic
+    stream (the listener's main loop already feeds the recorder when
+    `recorder.is_recording()` is true) and seeds the recorder with the
+    listener's rolling prebuffer on keydown. This catches audio spoken
+    just before the key actually landed, and avoids opening a second
+    concurrent WASAPI InputStream on the same device (two streams on
+    the same mic produced duplicate/interleaved frames and garbled
+    transcripts).
+
+    If no wake listener is available (--no-wake), PTT falls back to
+    opening its own InputStream while held.
+    """
+
+    def __init__(
+        self,
+        recorder: Recorder,
+        stop_event: threading.Event,
+        wake_listener: "WhisperWakeListener | None" = None,
+    ):
         self.recorder = recorder
         self.stop_event = stop_event
+        self._wake_listener = wake_listener
         self._held = False
+        self._owns_stream = False
         self._stream: sd.InputStream | None = None
         self._target_key = _parse_hotkey(config.PTT_HOTKEY)
 
@@ -52,7 +72,25 @@ class PTTKeyHandler:
             if not focus_passes_gate():
                 log.info("PTT suppressed: focus is %s", describe_current_focus())
                 return
-            if self.recorder.start(source="ptt", vad_endpoint=False):
+
+            prebuffer = None
+            if self._wake_listener is not None:
+                prebuffer = self._wake_listener.get_prebuffer()
+                # Prevent wake path from firing on PTT tail audio after
+                # release — it shares the same mic stream.
+                self._wake_listener.note_external_fire()
+
+            if not self.recorder.start(
+                source="ptt",
+                vad_endpoint=False,
+                prebuffer=prebuffer,
+            ):
+                return
+
+            # Wake listener's main loop will feed subsequent frames
+            # while recorder.is_recording(). Only open a dedicated
+            # stream when it isn't running.
+            if self._wake_listener is None:
                 self._open_stream()
 
     def on_release(self, key) -> None:
@@ -84,6 +122,7 @@ class PTTKeyHandler:
                 callback=_callback,
             )
             self._stream.start()
+            self._owns_stream = True
         except Exception:
             log.exception("Failed to open PTT input stream")
             self.recorder.stop()
@@ -97,6 +136,7 @@ class PTTKeyHandler:
                 log.exception("Error closing PTT stream")
             finally:
                 self._stream = None
+                self._owns_stream = False
 
 
 def _parse_hotkey(name: str):
@@ -143,10 +183,12 @@ def main(argv: list[str] | None = None) -> int:
 
     key_listener: keyboard.Listener | None = None
     if not args.no_ptt:
-        handler = PTTKeyHandler(recorder, stop_event)
+        handler = PTTKeyHandler(recorder, stop_event, wake_listener=wake)
         key_listener = keyboard.Listener(on_press=handler.on_press, on_release=handler.on_release)
         key_listener.start()
-        log.info("F9 push-to-talk armed")
+        src = "shared wake-listener stream" if wake is not None else "own stream"
+        log.info("F9 push-to-talk armed (audio: %s, prebuffer=%d ms)",
+                 src, config.PTT_PREBUFFER_MS if wake is not None else 0)
 
     def _shutdown(*_):
         log.info("Shutdown requested")
