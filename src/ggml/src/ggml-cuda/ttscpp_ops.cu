@@ -22,6 +22,19 @@
 #include "ttscpp_ops.cuh"
 
 #include <cmath>
+#include <cstdint>
+#include <mutex>
+#include <unordered_map>
+
+// rocFFT is only available on the ROCm/HIP backend. For any other
+// CUDA-ish backend (NVIDIA/MUSA) we fall back to the naive O(n_fft^2)
+// DFT kernels below. Lemondate is HIP-only today so the fallback is
+// mainly there to keep the file buildable if someone ever enables
+// the NVIDIA backend in this tree.
+#if defined(GGML_USE_HIP)
+#  include <rocfft/rocfft.h>
+#  define TTSCPP_USE_ROCFFT 1
+#endif
 
 #define TTSCPP_BLOCK 256
 
@@ -215,28 +228,416 @@ void ggml_cuda_op_uv_noise(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 }
 
 // ---------------------------------------------------------------------
-// STFT / AA_STFT
+// STFT / AA_STFT / ISTFT / AA_ISTFT
 // ---------------------------------------------------------------------
 //
-// CPU reference: ggml_compute_forward_stft_f32 in ggml-cpu.c (around
-// line 2014, koboldcpp tree). The reference extracts a windowed +
-// reflectively-padded segment of the time-domain signal for each frame,
-// then runs a radix-2 real FFT via radix2_fft(mdst, phdst, ...). For
-// AA_STFT it follows up with |z|/atan2 per bin.
+// CPU reference: ggml_compute_forward_stft_f32 / abs_angle_stft /
+// istft_f32 / abs_angle_istft in ggml-cpu.c (koboldcpp tree, ~line 2014
+// onwards). The CPU path window-applies + reflectively-pads each frame
+// and runs a radix-2 FFT (`radix2_fft`); the inverse runs `radix2_fft`
+// again on the spectrum and uses the N-i-mod-N permutation trick for
+// the iDFT. Kokoro's vocoder uses n_fft = 1024.
 //
-// Shapes (from ggml_stft in ggml.c):
-//   src0 (signal) : F32, shape [signal_len, batch, ...]
-//   src1 (window) : F32, shape [n_fft] (window length == n_fft)
-//   dst           : F32, shape [n_fft, n_frames, batch, 2]
-//                   -- last dim stores (real/imag) or (abs/angle).
-//   op_params     : [n_fft, hop] as int32_t.
+// Shapes (from ggml_stft / ggml_istft in ggml.c):
+//   STFT
+//     src0 (signal) : F32, shape [signal_len, batch, ...]
+//     src1 (window) : F32, shape [n_fft]
+//     dst           : F32, shape [n_fft, n_frames, batch, 2]
+//                     -- last dim is (real, imag) or (abs, angle).
+//     op_params     : [n_fft, hop] as int32_t.
+//   ISTFT
+//     src0 (spectrum): F32, shape [bins, n_frames, batch, 2]
+//                      bins == n_fft (full) or n_fft/2 + 1 (onesided).
+//     src1 (window)  : F32, shape [n_fft]
+//     dst            : F32, shape [(n_frames-1)*hop, batch]
 //
-// Kokoro uses n_fft = 1024. Per-frame cost of naive DFT is O(n_fft^2)
-// which is ~1M multiplies per (frame, bin) thread pair, but n_frames is
-// typically small (~O(tokens)) so the absolute wall-clock is well under
-// the STFT/ISTFT budget for a 1–2 s utterance. Correctness-first, no
-// rocFFT dependency.
+// rocFFT path (default on HIP): replace the naive O(n_fft^2) DFT with
+// rocfft_transform_type_real_forward / _real_inverse (O(n_fft log n_fft)).
+// A small prep kernel does the window + reflective padding and packs
+// the real input into a contiguous `[batch*n_frames, n_fft]` buffer; a
+// post kernel unpacks the n_fft/2+1 Hermitian output into the public
+// `[n_fft, n_frames, batch, 2]` layout (mirroring bins > n_fft/2 with
+// a conjugate flip on the imaginary part, matching what the full-N
+// radix2_fft returns for a real-valued input). For the inverse, an
+// OLA kernel does the overlap-add on the real time-domain frames
+// produced by rocFFT; each thread owns exactly one output sample so
+// the write is a plain store (no atomicAdd), which makes the output
+// bit-deterministic across runs.
 //
+// Fallback (NVIDIA CUDA / MUSA): the original naive DFT kernels are
+// kept below under #else. Lemondate today only builds against HIP, so
+// this branch is there purely to keep the file portable.
+
+#ifdef TTSCPP_USE_ROCFFT
+// rocFFT error-to-string glue so the shared CUDA_CHECK_GEN macro gives
+// useful messages on an FFT failure. Kept file-local since rocfft is
+// only linked from here.
+static const char * ttscpp_rocfft_status_str(rocfft_status s) {
+    switch (s) {
+        case rocfft_status_success:             return "rocfft_status_success";
+        case rocfft_status_failure:             return "rocfft_status_failure";
+        case rocfft_status_invalid_arg_value:   return "rocfft_status_invalid_arg_value";
+        case rocfft_status_invalid_dimensions:  return "rocfft_status_invalid_dimensions";
+        case rocfft_status_invalid_array_type:  return "rocfft_status_invalid_array_type";
+        case rocfft_status_invalid_strides:     return "rocfft_status_invalid_strides";
+        case rocfft_status_invalid_distance:    return "rocfft_status_invalid_distance";
+        case rocfft_status_invalid_offset:      return "rocfft_status_invalid_offset";
+        case rocfft_status_invalid_work_buffer: return "rocfft_status_invalid_work_buffer";
+    }
+    return "rocfft_status_unknown";
+}
+#define ROCFFT_CHECK(err) CUDA_CHECK_GEN(err, rocfft_status_success, ttscpp_rocfft_status_str)
+
+// Plan cache. rocfft_plan_create is moderately expensive (~ms on first
+// call for n_fft=1024, since rocFFT may JIT kernel variants); we want
+// to pay it once per unique (device, n_fft, number_of_transforms,
+// direction) tuple. number_of_transforms is batch*n_frames here, and
+// can legitimately change across calls (different utterance lengths),
+// so it's part of the key. In the single-GPU case lemondate runs in
+// today the cache stays at a handful of entries.
+//
+// rocFFT plans are bound to the HIP device that was current at the
+// time of rocfft_plan_create; we stash the device id in the key and
+// re-`ggml_cuda_set_device` before the plan_create if needed.
+struct ttscpp_rocfft_plan_key {
+    int      device;
+    int      n_fft;
+    int      n_transforms;
+    uint32_t direction; // 0 = real_forward, 1 = real_inverse
+
+    bool operator==(const ttscpp_rocfft_plan_key & o) const {
+        return device == o.device && n_fft == o.n_fft &&
+               n_transforms == o.n_transforms && direction == o.direction;
+    }
+};
+struct ttscpp_rocfft_plan_key_hash {
+    size_t operator()(const ttscpp_rocfft_plan_key & k) const noexcept {
+        // Cheap mixing - we only expect tens of entries in practice.
+        size_t h = (size_t) k.n_fft * 0x9E3779B185EBCA87ull;
+        h ^= (size_t) k.n_transforms * 0xC2B2AE3D27D4EB4Full + 0x165667B19E3779F9ull;
+        h ^= (((size_t) k.direction) << 8) ^ (size_t) k.device;
+        return h;
+    }
+};
+
+struct ttscpp_rocfft_plan {
+    rocfft_plan handle     = nullptr;
+    size_t      work_bytes = 0;
+};
+
+// Process-global rocFFT state: owns rocfft_setup/cleanup, the plan
+// cache, and a mutex serialising plan_create. Execute is re-entrant
+// in rocFFT so we don't hold the mutex across rocfft_execute.
+struct ttscpp_rocfft_global {
+    std::mutex mu;
+    std::unordered_map<ttscpp_rocfft_plan_key, ttscpp_rocfft_plan, ttscpp_rocfft_plan_key_hash> plans;
+
+    ttscpp_rocfft_global() {
+        ROCFFT_CHECK(rocfft_setup());
+    }
+    ~ttscpp_rocfft_global() {
+        for (auto & kv : plans) {
+            rocfft_plan_destroy(kv.second.handle);
+        }
+        rocfft_cleanup();
+    }
+
+    ttscpp_rocfft_plan get(int device, int n_fft, int n_transforms, bool inverse) {
+        std::lock_guard<std::mutex> lk(mu);
+        ttscpp_rocfft_plan_key key{device, n_fft, n_transforms, inverse ? 1u : 0u};
+        auto it = plans.find(key);
+        if (it != plans.end()) {
+            return it->second;
+        }
+
+        ttscpp_rocfft_plan p;
+        size_t lengths[1] = { (size_t) n_fft };
+        ROCFFT_CHECK(rocfft_plan_create(
+            &p.handle,
+            rocfft_placement_notinplace,
+            inverse ? rocfft_transform_type_real_inverse : rocfft_transform_type_real_forward,
+            rocfft_precision_single,
+            /*dimensions*/ 1,
+            lengths,
+            /*number_of_transforms*/ (size_t) n_transforms,
+            /*description*/ nullptr));
+        ROCFFT_CHECK(rocfft_plan_get_work_buffer_size(p.handle, &p.work_bytes));
+
+        plans.emplace(key, p);
+        return p;
+    }
+};
+
+static ttscpp_rocfft_global & ttscpp_rocfft() {
+    // Meyers singleton: rocfft_setup runs on first use, rocfft_cleanup
+    // runs at program exit. Thread-safe since C++11.
+    static ttscpp_rocfft_global g;
+    return g;
+}
+
+// Prep kernel: window-apply + reflective-pad the input signal into a
+// packed [batch, n_frames, n_fft] real buffer that rocFFT can consume
+// directly as `number_of_transforms` contiguous transforms.
+static __global__ void k_stft_prep(
+        const float * __restrict__ src,     // [ne00, batch, ...]
+        const float * __restrict__ window,  // [n_fft]
+        float       * __restrict__ prep,    // [batch*n_frames, n_fft] packed
+        const int n_fft, const int hop, const int half,
+        const int ne00,
+        const int n_frames, const int batch,
+        const int src_stride_batch) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int f = blockIdx.y;
+    const int b = blockIdx.z;
+    if (i >= n_fft || f >= n_frames || b >= batch) {
+        return;
+    }
+
+    const float * row = src + (int64_t) b * src_stride_batch;
+    const int ch = f * hop;
+    int ai = ch - half + i;
+    int idx;
+    if (ai < 0) {
+        idx = -ai;
+    } else if (ai >= ne00) {
+        idx = 2 * ne00 - ai - 1;
+    } else {
+        idx = ai;
+    }
+    prep[((int64_t) b * n_frames + f) * n_fft + i] = row[idx] * window[i];
+}
+
+// Post kernel: expand rocFFT's n_fft/2+1 Hermitian-interleaved output
+// into the public [n_fft, n_frames, batch, 2] dst layout. For bins in
+// (n_fft/2, n_fft) we apply the conjugate-mirror relation X[N-k] =
+// conj(X[k]) so the output matches what the full-N radix2_fft produces
+// on the CPU for a real-valued input. AA variant applies |.|/atan2
+// straight into (abs, angle) planes.
+static __global__ void k_stft_post(
+        const float * __restrict__ fft,     // [batch*n_frames, n_fft/2+1, {re,im}] packed
+        float       * __restrict__ dst,
+        const int n_fft, const int n_frames, const int batch,
+        const int dst_stride_frame, const int dst_stride_batch, const int dst_imag_stride,
+        const int compute_abs_angle) {
+    const int k = blockIdx.x * blockDim.x + threadIdx.x;
+    const int f = blockIdx.y;
+    const int b = blockIdx.z;
+    if (k >= n_fft || f >= n_frames || b >= batch) {
+        return;
+    }
+
+    const int half = n_fft / 2;
+    int   src_k     = k;
+    float sign_imag = 1.0f;
+    if (k > half) {
+        src_k     = n_fft - k;
+        sign_imag = -1.0f;
+    }
+
+    const int64_t row     = (int64_t) b * n_frames + f;
+    const int64_t bin_off = (row * (half + 1) + src_k) * 2;
+    const float   re      = fft[bin_off + 0];
+    const float   im      = sign_imag * fft[bin_off + 1];
+
+    float * out = dst + (int64_t) b * dst_stride_batch + (int64_t) f * dst_stride_frame;
+    if (compute_abs_angle) {
+        out[k]                   = sqrtf(re * re + im * im);
+        out[k + dst_imag_stride] = atan2f(im, re);
+    } else {
+        out[k]                   = re;
+        out[k + dst_imag_stride] = im;
+    }
+}
+
+// Prep kernel for the inverse transform: pack a Hermitian-symmetric
+// [batch*n_frames, n_fft/2+1] complex spectrum into the rocFFT-ready
+// contiguous buffer. Two input variants:
+//   * from_abs_angle=true : src holds (abs, angle) pairs; we rebuild
+//     re = abs*cos(angle), im = abs*sin(angle).
+//   * from_abs_angle=false: src holds (real, imag) pairs; we copy the
+//     first n_fft/2+1 bins as-is (assumes Hermitian symmetry, which
+//     holds whenever the upstream STFT was applied to a real signal).
+//
+// We intentionally do NOT replicate the CPU's "ph = m" quirk for the
+// non-AA onesided path (see the note in the CPU reference). Kokoro
+// only hits the AA path; that quirk produces garbage anyway and is
+// called out as cold in the CPU code.
+static __global__ void k_istft_prep(
+        const float * __restrict__ src,     // arbitrary-strided [bins, n_frames, batch, {re|abs, im|ang}]
+        float       * __restrict__ prep,    // [batch*n_frames, n_fft/2+1, {re,im}] packed
+        const int n_fft, const int n_frames, const int batch,
+        const int src_stride_frame, const int src_stride_batch, const int src_imag_stride,
+        const int from_abs_angle) {
+    const int k    = blockIdx.x * blockDim.x + threadIdx.x;
+    const int f    = blockIdx.y;
+    const int b    = blockIdx.z;
+    const int half = n_fft / 2;
+    if (k > half || f >= n_frames || b >= batch) {
+        return;
+    }
+
+    const float * row_r = src + (int64_t) b * src_stride_batch + (int64_t) f * src_stride_frame;
+    const float * row_i = row_r + src_imag_stride;
+
+    float re, im;
+    if (from_abs_angle) {
+        const float abs_v = row_r[k];
+        const float agl   = row_i[k];
+        re = abs_v * cosf(agl);
+        im = abs_v * sinf(agl);
+    } else {
+        re = row_r[k];
+        im = row_i[k];
+    }
+
+    const int64_t row = (int64_t) b * n_frames + f;
+    prep[(row * (half + 1) + k) * 2 + 0] = re;
+    prep[(row * (half + 1) + k) * 2 + 1] = im;
+}
+
+// Deterministic overlap-add. One thread per (output sample, batch);
+// iterate the (small, bounded by n_fft/hop) set of frames that cover
+// this output index and accumulate into a thread-local `acc` before a
+// single plain store. No atomicAdd == bit-identical output across
+// runs.
+//
+// rocFFT c2r is unscaled: its output is N*x[n] where x is the true
+// inverse DFT. The CPU reference applies the 1/N factor inside the
+// OLA loop (`mdst[i] / n_fft * window[base_index]`) so we do the
+// same. Matches the CPU exactly up to fp associativity of the sum
+// (the frame count per output sample is always <=  n_fft/hop, 4 in
+// the Kokoro preset).
+static __global__ void k_istft_ola(
+        float       * __restrict__ dst,        // [dst_length, batch]
+        const float * __restrict__ frames,     // [batch*n_frames, n_fft] packed
+        const float * __restrict__ window,     // [n_fft]
+        const int dst_length,
+        const int n_fft, const int hop, const int half,
+        const int n_frames, const int batch,
+        const int dst_stride_batch) {
+    const int j = blockIdx.x * blockDim.x + threadIdx.x;
+    const int b = blockIdx.y;
+    if (j >= dst_length || b >= batch) {
+        return;
+    }
+
+    // CPU writes: tgt[f*hop + n - half] += x[f, n] * window[n] for
+    // n in [0, n_fft). Invert: for output index j, n = j + half - f*hop
+    // must land in [0, n_fft), hence f*hop in (j+half-n_fft, j+half].
+    const int num_low   = j + half - n_fft + 1;
+    const int first_f   = (num_low <= 0) ? 0 : (num_low + hop - 1) / hop;
+    const int num_high  = j + half;
+    int       last_f    = num_high / hop;
+    if (last_f > n_frames - 1) {
+        last_f = n_frames - 1;
+    }
+
+    float acc = 0.0f;
+    for (int f = first_f; f <= last_f; ++f) {
+        const int n = j + half - f * hop;
+        if (n >= 0 && n < n_fft) {
+            const int64_t row = (int64_t) b * n_frames + f;
+            acc += frames[row * n_fft + n] * window[n] / (float) n_fft;
+        }
+    }
+    dst[(int64_t) b * dst_stride_batch + j] = acc;
+}
+
+static void ggml_cuda_op_stft_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst, bool compute_abs_angle) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+
+    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    GGML_ASSERT(src1->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type  == GGML_TYPE_F32);
+    GGML_ASSERT(src0->nb[0] == sizeof(float));
+    GGML_ASSERT(src1->nb[0] == sizeof(float));
+    GGML_ASSERT(dst->nb[0]  == sizeof(float));
+
+    const int n_fft = ((const int32_t *) dst->op_params)[0];
+    const int hop   = ((const int32_t *) dst->op_params)[1];
+    const int half  = n_fft / 2;
+
+    const int ne00     = (int) src0->ne[0];
+    const int n_frames = (int) dst->ne[1];
+    const int batch    = (int) MAX(dst->ne[2], (int64_t) 1);
+
+    GGML_ASSERT((int) src1->ne[0] == n_fft);
+    GGML_ASSERT((int) dst->ne[0]  == n_fft);
+    GGML_ASSERT((int) dst->ne[3]  == 2);
+
+    const size_t es = sizeof(float);
+    const int src_stride_batch = (int) (src0->nb[1] / es);
+    const int dst_stride_frame = (int) (dst->nb[1]  / es);
+    const int dst_stride_batch = (int) (dst->nb[2]  / es);
+    const int dst_imag_stride  = (int) (dst->nb[3]  / es);
+
+    const int64_t n_transforms = (int64_t) batch * n_frames;
+    if (n_transforms == 0) {
+        return;
+    }
+
+    const size_t prep_elems = (size_t) n_transforms * n_fft;
+    const size_t fft_elems  = (size_t) n_transforms * 2 * (half + 1);
+
+    ggml_cuda_pool_alloc<float> prep(ctx.pool(), prep_elems);
+    ggml_cuda_pool_alloc<float> fft (ctx.pool(), fft_elems);
+
+    cudaStream_t stream = ctx.stream();
+
+    // Stage 1: window + reflective-pad into a packed real buffer.
+    {
+        const int block_x = 128;
+        const dim3 block(block_x, 1, 1);
+        const dim3 grid((n_fft + block_x - 1) / block_x,
+                        (unsigned int) n_frames,
+                        (unsigned int) batch);
+        k_stft_prep<<<grid, block, 0, stream>>>(
+            (const float *) src0->data,
+            (const float *) src1->data,
+            prep.get(),
+            n_fft, hop, half, ne00,
+            n_frames, batch, src_stride_batch);
+    }
+
+    // Stage 2: rocFFT real-forward transform. Plan is cached on
+    // (device, n_fft, n_transforms, forward). rocFFT forward output is
+    // unscaled, matching the CPU radix2_fft convention — the post
+    // kernel and downstream math don't need a normaliser.
+    ttscpp_rocfft_plan plan =
+        ttscpp_rocfft().get(ctx.device, n_fft, (int) n_transforms, /*inverse=*/false);
+
+    rocfft_execution_info info = nullptr;
+    ROCFFT_CHECK(rocfft_execution_info_create(&info));
+    ROCFFT_CHECK(rocfft_execution_info_set_stream(info, (void *) stream));
+
+    ggml_cuda_pool_alloc<char> work;
+    if (plan.work_bytes > 0) {
+        work.alloc(ctx.pool(), plan.work_bytes);
+        ROCFFT_CHECK(rocfft_execution_info_set_work_buffer(info, work.get(), plan.work_bytes));
+    }
+
+    void * in_buf[1]  = { prep.get() };
+    void * out_buf[1] = { fft.get() };
+    ROCFFT_CHECK(rocfft_execute(plan.handle, in_buf, out_buf, info));
+    ROCFFT_CHECK(rocfft_execution_info_destroy(info));
+
+    // Stage 3: Hermitian-mirror + (optional) abs/angle into public layout.
+    {
+        const int block_x = 128;
+        const dim3 block(block_x, 1, 1);
+        const dim3 grid((n_fft + block_x - 1) / block_x,
+                        (unsigned int) n_frames,
+                        (unsigned int) batch);
+        k_stft_post<<<grid, block, 0, stream>>>(
+            fft.get(),
+            (float *) dst->data,
+            n_fft, n_frames, batch,
+            dst_stride_frame, dst_stride_batch, dst_imag_stride,
+            compute_abs_angle ? 1 : 0);
+    }
+}
+#else // !TTSCPP_USE_ROCFFT - naive fallback kept for NVIDIA/MUSA builds
 // Launch pattern: one thread per (bin, frame, batch). Bins are the fast
 // dim so memory writes coalesce across threadIdx.x.
 static __global__ void k_stft(
@@ -270,8 +671,6 @@ static __global__ void k_stft(
     float sum_r = 0.0f;
     float sum_i = 0.0f;
     for (int j = 0; j < n_fft; j++) {
-        // Reflective padding: mirror out-of-bounds indices back into the
-        // signal so windows near the edges stay well-defined.
         int ai = ch - half + j;
         int idx;
         if (ai < 0) {
@@ -321,7 +720,6 @@ static void ggml_cuda_op_stft_impl(ggml_backend_cuda_context & ctx, ggml_tensor 
     const int n_frames = (int) dst->ne[1];
     const int batch    = (int) dst->ne[2];
 
-    // The CPU impl only supports window length == n_fft.
     GGML_ASSERT((int) src1->ne[0] == n_fft);
     GGML_ASSERT((int) dst->ne[0]  == n_fft);
     GGML_ASSERT((int) dst->ne[3]  == 2);
@@ -347,6 +745,7 @@ static void ggml_cuda_op_stft_impl(ggml_backend_cuda_context & ctx, ggml_tensor 
         src_stride_batch, dst_stride_frame, dst_stride_batch, dst_imag_stride,
         compute_abs_angle ? 1 : 0);
 }
+#endif // TTSCPP_USE_ROCFFT
 
 void ggml_cuda_op_stft(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_op_stft_impl(ctx, dst, /*compute_abs_angle=*/false);
@@ -356,42 +755,115 @@ void ggml_cuda_op_aa_stft(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_op_stft_impl(ctx, dst, /*compute_abs_angle=*/true);
 }
 
-// ---------------------------------------------------------------------
-// ISTFT / AA_ISTFT
-// ---------------------------------------------------------------------
-//
-// CPU reference: ggml_compute_forward_istft_f32 in ggml-cpu.c (~line
-// 2142). For each frame it computes the real part of the inverse DFT
-// of the per-frame spectrum, then overlap-adds into the time-domain
-// output with the window re-applied. The CPU implements the iDFT via a
-// forward FFT + index permutation (N-i mod N) trick; here we just do
-// the iDFT directly — the arithmetic is identical, the loop layout
-// differs.
-//
-// Input src0 shape  : [bins, n_frames, batch, 2]  (complex pair via nb3)
-//                     bins == n_fft for the full-spectrum case,
-//                     bins == n_fft/2 + 1 for the onesided case.
-// Input src1        : window, [n_fft].
-// Output dst shape  : [(n_frames-1)*hop, batch, 1, 1].
-//
-// AA_ISTFT: src0 contains (abs, angle) per bin; reconstruct complex as
-// z = abs * (cos(angle) + j * mult * sin(angle)) where mult = -1 for
-// mirrored bins (>half) under the onesided convention, else +1.
-//
-// NOTE: the CPU path has what looks like an unreachable corner in the
-// non-abs-angle onesided branch where `ph = m` instead of `ph = phdst`.
-// We preserve that behaviour literally so a graph that mixes CPU and
-// CUDA backends produces bit-identical output. Kokoro only uses the
-// abs-angle path, so this corner is cold in practice.
-//
-// Launch pattern: one thread per (n, frame, batch) where n is the
-// sample index within the frame [0, n_fft). Each thread computes the
-// real part of iDFT[n], applies the window, and atomically adds into
-// the output at position (frame*hop + n - half).
+// ISTFT / AA_ISTFT impl -- rocFFT c2r + deterministic OLA.
+#ifdef TTSCPP_USE_ROCFFT
+static void ggml_cuda_op_istft_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst, bool from_abs_angle) {
+    const ggml_tensor * src0   = dst->src[0];
+    const ggml_tensor * window = dst->src[1];
+
+    GGML_ASSERT(src0->type   == GGML_TYPE_F32);
+    GGML_ASSERT(window->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type    == GGML_TYPE_F32);
+    GGML_ASSERT(src0->nb[0]   == sizeof(float));
+    GGML_ASSERT(window->nb[0] == sizeof(float));
+    GGML_ASSERT(dst->nb[0]    == sizeof(float));
+
+    const int n_fft = ((const int32_t *) dst->op_params)[0];
+    const int hop   = ((const int32_t *) dst->op_params)[1];
+    const int half  = n_fft / 2;
+
+    const int ne00       = (int) src0->ne[0];
+    const int n_frames   = (int) src0->ne[1];
+    const int batch      = (int) MAX(src0->ne[2], (int64_t) 1);
+    const int dst_length = (int) dst->ne[0];
+
+    GGML_ASSERT((int) window->ne[0] == n_fft);
+    GGML_ASSERT(ne00 == n_fft || ne00 == half + 1);
+
+    const size_t es = sizeof(float);
+    const int src_stride_frame = (int) (src0->nb[1] / es);
+    const int src_stride_batch = (int) (src0->nb[2] / es);
+    const int src_imag_stride  = (int) (src0->nb[3] / es);
+    const int dst_stride_batch = (int) (dst->nb[1]  / es);
+
+    const int64_t n_transforms = (int64_t) batch * n_frames;
+    if (n_transforms == 0 || dst_length == 0) {
+        // No frames -> zero-length output. Zero dst so consumers see a
+        // deterministic buffer instead of uninitialised pool memory.
+        CUDA_CHECK(cudaMemsetAsync(dst->data, 0, ggml_nbytes(dst), ctx.stream()));
+        return;
+    }
+
+    const size_t prep_elems = (size_t) n_transforms * 2 * (half + 1);
+    const size_t fft_elems  = (size_t) n_transforms * n_fft;
+
+    ggml_cuda_pool_alloc<float> prep(ctx.pool(), prep_elems);
+    ggml_cuda_pool_alloc<float> fft (ctx.pool(), fft_elems);
+
+    cudaStream_t stream = ctx.stream();
+
+    // Stage 1: assemble Hermitian-symmetric complex spectrum from src.
+    {
+        const int block_x = 128;
+        const dim3 block(block_x, 1, 1);
+        const dim3 grid(((half + 1) + block_x - 1) / block_x,
+                        (unsigned int) n_frames,
+                        (unsigned int) batch);
+        k_istft_prep<<<grid, block, 0, stream>>>(
+            (const float *) src0->data,
+            prep.get(),
+            n_fft, n_frames, batch,
+            src_stride_frame, src_stride_batch, src_imag_stride,
+            from_abs_angle ? 1 : 0);
+    }
+
+    // Stage 2: rocFFT real-inverse. Plan cached on (device, n_fft,
+    // n_transforms, inverse). rocFFT c2r is unscaled; the 1/N factor
+    // happens inside the OLA kernel so downstream arithmetic matches
+    // the CPU `mdst[i] / n_fft` convention.
+    ttscpp_rocfft_plan plan =
+        ttscpp_rocfft().get(ctx.device, n_fft, (int) n_transforms, /*inverse=*/true);
+
+    rocfft_execution_info info = nullptr;
+    ROCFFT_CHECK(rocfft_execution_info_create(&info));
+    ROCFFT_CHECK(rocfft_execution_info_set_stream(info, (void *) stream));
+
+    ggml_cuda_pool_alloc<char> work;
+    if (plan.work_bytes > 0) {
+        work.alloc(ctx.pool(), plan.work_bytes);
+        ROCFFT_CHECK(rocfft_execution_info_set_work_buffer(info, work.get(), plan.work_bytes));
+    }
+
+    void * in_buf[1]  = { prep.get() };
+    void * out_buf[1] = { fft.get() };
+    ROCFFT_CHECK(rocfft_execute(plan.handle, in_buf, out_buf, info));
+    ROCFFT_CHECK(rocfft_execution_info_destroy(info));
+
+    // Stage 3: deterministic overlap-add. One thread per (out_sample,
+    // batch); no atomicAdd => run-to-run bit-identical output.
+    {
+        const int block_x = 128;
+        const dim3 block(block_x, 1, 1);
+        const dim3 grid((dst_length + block_x - 1) / block_x,
+                        (unsigned int) batch,
+                        1);
+        k_istft_ola<<<grid, block, 0, stream>>>(
+            (float *) dst->data,
+            fft.get(),
+            (const float *) window->data,
+            dst_length,
+            n_fft, hop, half, n_frames, batch,
+            dst_stride_batch);
+    }
+}
+#else // !TTSCPP_USE_ROCFFT -- naive iDFT fallback for non-HIP builds
+// Launch pattern: one thread per (n, frame, batch). Uses atomicAdd to
+// overlap-add into the output; NOT bit-deterministic across runs.
+// Kept only so the file compiles without rocFFT available.
 static __global__ void k_istft(
-        const float * __restrict__ src,    // [ne00, n_frames, batch, 2]
-        const float * __restrict__ window, // [n_fft]
-        float       * __restrict__ dst,    // [dst_length, batch]
+        const float * __restrict__ src,
+        const float * __restrict__ window,
+        float       * __restrict__ dst,
         const int  n_fft,
         const int  hop,
         const int  half,
@@ -399,10 +871,10 @@ static __global__ void k_istft(
         const int  n_frames,
         const int  batch,
         const int  dst_length,
-        const int  src_stride_frame, // elements
-        const int  src_stride_batch, // elements
-        const int  src_imag_stride,  // elements (nb03 / sizeof(float))
-        const int  dst_stride_batch, // elements
+        const int  src_stride_frame,
+        const int  src_stride_batch,
+        const int  src_imag_stride,
+        const int  dst_stride_batch,
         const int  from_abs_angle) {
     const int n     = blockIdx.x * blockDim.x + threadIdx.x;
     const int frame = blockIdx.y;
@@ -416,7 +888,6 @@ static __global__ void k_istft(
     const float * src_real = src + b * src_stride_batch + frame * src_stride_frame;
     const float * src_imag = src_real + src_imag_stride;
 
-    // Inverse DFT: x[n].real = (1/N) * sum_k (X_r[k]*cos - X_i[k]*sin).
     const float base_k = 2.0f * (float) M_PI / (float) n_fft;
 
     float sum = 0.0f;
@@ -438,9 +909,6 @@ static __global__ void k_istft(
             m  = abs_v * cs;
             ph = abs_v * multiplier * sn;
         } else if (onesided) {
-            // Preserve CPU-impl quirk: non-AA onesided leaves ph = m
-            // (the real part at idx) rather than the mirrored imag.
-            // Cold path for Kokoro but we mirror it bit-for-bit.
             m  = src_real[idx];
             ph = m;
         } else {
@@ -491,7 +959,6 @@ static void ggml_cuda_op_istft_impl(ggml_backend_cuda_context & ctx, ggml_tensor
     const int src_imag_stride  = (int) (src0->nb[3] / es);
     const int dst_stride_batch = (int) (dst->nb[1]  / es);
 
-    // dst is accumulated via atomicAdd; callers expect it zero'd first.
     CUDA_CHECK(cudaMemsetAsync(dst->data, 0, ggml_nbytes(dst), ctx.stream()));
 
     const int block_x = 128;
@@ -509,6 +976,7 @@ static void ggml_cuda_op_istft_impl(ggml_backend_cuda_context & ctx, ggml_tensor
         src_stride_frame, src_stride_batch, src_imag_stride, dst_stride_batch,
         from_abs_angle ? 1 : 0);
 }
+#endif // TTSCPP_USE_ROCFFT
 
 void ggml_cuda_op_istft(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_op_istft_impl(ctx, dst, /*from_abs_angle=*/false);

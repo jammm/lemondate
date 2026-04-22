@@ -42,12 +42,16 @@ endif()
 find_package(hip     REQUIRED)
 find_package(hipblas REQUIRED)
 find_package(rocblas REQUIRED)
+# lemondate: rocFFT is used by ttscpp_ops.cu for STFT/ISTFT. Provided
+# by TheRock SDK at <rocm>/lib/cmake/rocfft/rocfft-config.cmake; the
+# import target is `roc::rocfft` (see rocfft-targets.cmake).
+find_package(rocfft  REQUIRED)
 
 if (${hip_VERSION} VERSION_LESS 6.1)
     message(FATAL_ERROR "At least ROCM/HIP V6.1 is required")
 endif()
 
-message(STATUS "HIP and hipBLAS found")
+message(STATUS "HIP, hipBLAS, and rocFFT found")
 
 # Workaround old compilers
 set(CMAKE_HIP_FLAGS "${CMAKE_HIP_FLAGS} --gpu-max-threads-per-block=1024")
@@ -138,4 +142,4 @@ if (GGML_STATIC)
     message(FATAL_ERROR "Static linking not supported for HIP/ROCm")
 endif()
 
-target_link_libraries(ggml-hip PRIVATE ggml-base hip::host roc::rocblas roc::hipblas)
+target_link_libraries(ggml-hip PRIVATE ggml-base hip::host roc::rocblas roc::hipblas roc::rocfft)
