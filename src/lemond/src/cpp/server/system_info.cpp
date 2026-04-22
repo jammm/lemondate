@@ -158,6 +158,11 @@ static const std::vector<RecipeBackendDef> RECIPE_DEFS = {
     {"kokoro", "cpu", {"windows", "linux"}, {
         {"cpu", {"x86_64"}},
     }},
+    // kokoro - HIP backend for AMD GPUs (mirrors whispercpp/rocm gating)
+    {"kokoro", "hip", {"windows", "linux"}, {
+        {"amd_igpu", {"gfx1150", "gfx1151"}},                  // STX Point/Halo iGPUs
+        {"amd_dgpu", {"gfx103X", "gfx110X", "gfx120X"}},       // RDNA2/3/4 dGPUs
+    }},
 
     // stable-diffusion.cpp - ROCm backend for AMD GPUs
     {"sd-cpp", "rocm", {"windows", "linux"}, {

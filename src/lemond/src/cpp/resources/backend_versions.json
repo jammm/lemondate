@@ -23,7 +23,8 @@
     "npu": "v0.9.38"
   },
   "kokoro": {
-    "cpu": "b16"
+    "cpu": "b16",
+    "hip": "local"
   },
   "clear_bin_if_lemonade_below": "9.4.0"
 }

@@ -194,7 +194,11 @@ static const EnvMapping env_mappings[] = {
     // ryzenai
     {"LEMONADE_RYZENAI_SERVER_BIN",      "ryzenai", "server_bin"},
     // kokoro
+    {"LEMONADE_KOKORO_BACKEND",          "kokoro", "backend"},
+    {"LEMONADE_KOKORO_ARGS",             "kokoro", "args"},
     {"LEMONADE_KOKORO_CPU_BIN",          "kokoro", "cpu_bin"},
+    {"LEMONADE_KOKORO_HIP_BIN",          "kokoro", "hip_bin"},
+    {"LEMONADE_KOKORO_HIP_MODEL",        "kokoro", "hip_model"},
 };
 
 /// Parse a string value to match the JSON type of the corresponding default.

@@ -36,7 +36,7 @@ static bool is_backend_name(const std::string& key) {
 
 // Backends that have a selectable "backend" key
 static const std::vector<std::string> s_selectable_backends = {
-    "llamacpp", "whispercpp", "sdcpp"
+    "llamacpp", "whispercpp", "sdcpp", "kokoro"
 };
 
 static bool has_backend_selection(const std::string& config_section) {
@@ -252,6 +252,12 @@ json RuntimeConfig::recipe_options() const {
         if (flm.contains("args")) result["flm_args"] = flm["args"];
     }
 
+    if (config_.contains("kokoro")) {
+        const auto& kk = config_["kokoro"];
+        if (kk.contains("backend")) result["kokoro_backend"] = resolve_auto(kk["backend"]);
+        if (kk.contains("args")) result["kokoro_args"] = kk["args"];
+    }
+
     if (config_.contains("ctx_size")) result["ctx_size"] = config_["ctx_size"];
 
     return result;
@@ -386,6 +392,18 @@ void RuntimeConfig::validate_backend(const std::string& backend, const std::stri
         }
         if (value.get<double>() <= 0.0) {
             throw std::invalid_argument("'" + backend + "." + key + "' must be positive");
+        }
+    }
+    else if (key == "hip_model") {
+        // Path to the kokoro.cpp .gguf model file (kokoro.hip_model).
+        // Allow empty string (default) or an existing file path.
+        if (!value.is_string()) {
+            throw std::invalid_argument("'" + backend + "." + key + "' must be a string");
+        }
+        const std::string str = value.get<std::string>();
+        if (!str.empty() && !fs::exists(str)) {
+            throw std::invalid_argument(
+                "'" + backend + "." + key + "' path does not exist: " + str);
         }
     }
     else {

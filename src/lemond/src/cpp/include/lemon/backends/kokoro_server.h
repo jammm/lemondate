@@ -43,6 +43,14 @@ public:
 
     // ITextToSpeechServer implementation
     void audio_speech(const json& request, httplib::DataSink& sink) override;
+
+private:
+    // Load path for the "hip" backend: launches kokoro-hip-server.exe (built
+    // in lemondate's src/kokoro-hip-server/) against a single .gguf model.
+    void load_hip(const std::string& model_name,
+                  const ModelInfo& model_info,
+                  const RecipeOptions& options,
+                  bool do_not_upgrade);
 };
 
 } // namespace backends

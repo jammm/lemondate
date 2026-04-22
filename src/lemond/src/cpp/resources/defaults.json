@@ -47,6 +47,10 @@
     "server_bin": "builtin"
   },
   "kokoro": {
-    "cpu_bin": "builtin"
+    "backend": "auto",
+    "args": "",
+    "cpu_bin": "builtin",
+    "hip_bin": "builtin",
+    "hip_model": ""
   }
 }

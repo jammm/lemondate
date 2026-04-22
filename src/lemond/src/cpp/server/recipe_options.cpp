@@ -28,7 +28,10 @@ static const json DEFAULTS = {
     {"sampling_method", ""},
     {"flow_shift", 0.0},
     // FLM-specific options
-    {"flm_args", ""}       // Custom arguments to pass to flm serve
+    {"flm_args", ""},      // Custom arguments to pass to flm serve
+    // Kokoro-specific options
+    {"kokoro_backend", ""},  // "" means auto-detect (mapped from "auto" in config.json)
+    {"kokoro_args", ""}
 };
 
 // Mapping from flat option names to CLI flags (used by to_cli_options)
@@ -57,6 +60,8 @@ static std::vector<std::string> get_keys_for_recipe(const std::string& recipe) {
         return {"ctx_size"};
     } else if (recipe == "sd-cpp") {
         return {"sd-cpp_backend", "sdcpp_args", "steps", "cfg_scale", "width", "height", "sampling_method", "flow_shift"};
+    } else if (recipe == "kokoro") {
+        return {"kokoro_backend", "kokoro_args"};
     } else {
         return {};
     }

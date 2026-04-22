@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include <iostream>
 #include <csignal>
 #include <atomic>
@@ -14,6 +15,21 @@
 #endif
 
 using namespace lemon;
+
+// Set an environment variable only if the user hasn't already set it. This
+// lets power users disable our ROCm/HIP knobs via e.g. `$env:... = "0"`
+// before launching lemond.
+static void putenv_if_unset(const char* name, const char* value) {
+    const char* existing = std::getenv(name);
+    if (existing != nullptr && existing[0] != '\0') {
+        return;
+    }
+#ifdef _WIN32
+    _putenv_s(name, value);
+#else
+    setenv(name, value, /*overwrite=*/0);
+#endif
+}
 
 // Global flag for signal handling
 static std::atomic<bool> g_shutdown_requested(false);
@@ -44,6 +60,13 @@ void signal_handler(int signal) {
 }
 
 int main(int argc, char** argv) {
+    // ROCm/HIP runtime knobs that must be set before any ggml/HIP code runs.
+    // overwrite=0 so a user can disable via e.g.
+    //   PowerShell:  $env:ROCBLAS_USE_HIPBLASLT = "0"
+    //   bash:        ROCBLAS_USE_HIPBLASLT=0 lemond ...
+    putenv_if_unset("ROCBLAS_USE_HIPBLASLT", "1");
+    putenv_if_unset("GGML_CUDA_FORCE_MMQ", "1");
+
     try {
         CLIParser parser;
         parser.parse(argc, argv);
