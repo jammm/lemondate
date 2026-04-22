@@ -166,9 +166,28 @@ if exist "%BUILD_DIR%\bin\whisper-server.exe"     copy /y "%BUILD_DIR%\bin\whisp
 if exist "%BUILD_DIR%\bin\kokoro-hip-server.exe"  copy /y "%BUILD_DIR%\bin\kokoro-hip-server.exe" "%CD%\bin\" >nul
 for %%F in ("%BUILD_DIR%\bin\*.dll") do copy /y "%%F" "%CD%\bin\" >nul 2>&1
 
-if exist "%LEMOND_BUILD%\bin\lemond.exe"    copy /y "%LEMOND_BUILD%\bin\lemond.exe" "%CD%\bin\" >nul
-if exist "%LEMOND_BUILD%\bin\lemonade.exe"  copy /y "%LEMOND_BUILD%\bin\lemonade.exe" "%CD%\bin\" >nul
-for %%F in ("%LEMOND_BUILD%\bin\*.dll") do copy /y "%%F" "%CD%\bin\" >nul 2>&1
+REM lemond's CMake outputs: lemond.exe at build root, other exes at build\Release\
+if exist "%LEMOND_BUILD%\lemond.exe"                copy /y "%LEMOND_BUILD%\lemond.exe"                "%CD%\bin\" >nul
+if exist "%LEMOND_BUILD%\Release\lemonade.exe"      copy /y "%LEMOND_BUILD%\Release\lemonade.exe"      "%CD%\bin\" >nul
+if exist "%LEMOND_BUILD%\Release\LemonadeServer.exe" copy /y "%LEMOND_BUILD%\Release\LemonadeServer.exe" "%CD%\bin\" >nul
+for %%F in ("%LEMOND_BUILD%\*.dll") do copy /y "%%F" "%CD%\bin\" >nul 2>&1
+
+REM Stage lemond's resources (defaults.json, server_models.json, etc.) next
+REM to lemond.exe. ConfigFile::get_defaults() looks them up via
+REM get_resource_path("resources/..."), which searches relative to the
+REM executable's dir first.
+if not exist "%CD%\bin\resources" mkdir "%CD%\bin\resources"
+xcopy /E /Y /Q /I "%LEMOND_SRC%\src\cpp\resources" "%CD%\bin\resources" >nul
+
+REM lemond's libcurl links against zlib1 + libssh2 as DLLs. On this
+REM build host those resolve to Strawberry Perl's C toolchain; copy
+REM them into bin so end-users don't need Strawberry Perl on PATH.
+REM Fall through silently if the install path differs.
+if exist "C:\Strawberry\c\bin\zlib1__.dll"     copy /y "C:\Strawberry\c\bin\zlib1__.dll"     "%CD%\bin\" >nul 2>&1
+if exist "C:\Strawberry\c\bin\libssh2-1__.dll" copy /y "C:\Strawberry\c\bin\libssh2-1__.dll" "%CD%\bin\" >nul 2>&1
+
+REM rocFFT runtime (needed by ggml-hip for the ttscpp STFT/ISTFT path)
+if exist "%ROCM_ROOT%\bin\rocfft.dll" copy /y "%ROCM_ROOT%\bin\rocfft.dll" "%CD%\bin\" >nul 2>&1
 
 echo.
 echo [lemondate] Build complete. Binaries staged under "%CD%\bin\".
