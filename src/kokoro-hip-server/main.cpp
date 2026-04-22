@@ -39,8 +39,23 @@
 #include <thread>
 #include <vector>
 
+// Include cpp-httplib first: it pulls in <winsock2.h>, which must come
+// before <windows.h> (windows.h has its own <winsock.h> include guard
+// that poisons winsock2.h if ordered the other way round).
 #include <httplib.h>
 #include <nlohmann/json.hpp>
+
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <dbghelp.h>
+#pragma comment(lib, "dbghelp.lib")
+#endif
 
 #include "ttscpp.h"
 #include "ttscommon.h"
@@ -64,6 +79,51 @@ static std::mutex g_last_mu;
 static std::string g_last_text;
 static std::string g_last_voice;
 static std::string g_crash_log_path;
+static std::string g_crash_dump_dir;
+
+#if defined(_WIN32)
+// Write a full-memory minidump next to the crash log so we can post-mortem
+// with cdb/windbg: `cdb -z kokoro-hip-*.dmp -c "!analyze -v; kp; q"`.
+// Self-contained — no HKLM LocalDumps registry entry (= no admin) required.
+static void write_minidump(EXCEPTION_POINTERS * ep) {
+    if (g_crash_dump_dir.empty()) return;
+
+    CreateDirectoryA(g_crash_dump_dir.c_str(), nullptr);
+
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    char name[MAX_PATH];
+    snprintf(name, sizeof(name),
+        "%s\\kokoro-hip-%04d%02d%02d-%02d%02d%02d-%u.dmp",
+        g_crash_dump_dir.c_str(),
+        st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond,
+        (unsigned)GetCurrentProcessId());
+
+    HANDLE h = CreateFileA(name, GENERIC_WRITE, 0, nullptr,
+                           CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+
+    MINIDUMP_EXCEPTION_INFORMATION mei{};
+    mei.ThreadId = GetCurrentThreadId();
+    mei.ExceptionPointers = ep;
+    mei.ClientPointers = FALSE;
+
+    MINIDUMP_TYPE type = (MINIDUMP_TYPE)(
+        MiniDumpWithDataSegs | MiniDumpWithThreadInfo |
+        MiniDumpWithUnloadedModules | MiniDumpWithIndirectlyReferencedMemory);
+
+    MiniDumpWriteDump(GetCurrentProcess(), GetCurrentProcessId(), h,
+                      type, ep ? &mei : nullptr, nullptr, nullptr);
+    CloseHandle(h);
+
+    fprintf(stderr, "[kokoro-hip-server] minidump: %s\n", name);
+}
+
+static LONG WINAPI crash_seh(EXCEPTION_POINTERS * ep) {
+    write_minidump(ep);
+    return EXCEPTION_CONTINUE_SEARCH; // let WER/CRT also see it
+}
+#endif
 
 static void write_crash_record(const char * reason) {
     std::string snap_text, snap_voice;
@@ -101,12 +161,18 @@ static void write_crash_record(const char * reason) {
 
 static void crash_sigabrt(int) {
     write_crash_record("SIGABRT");
+#if defined(_WIN32)
+    write_minidump(nullptr);
+#endif
     std::signal(SIGABRT, SIG_DFL);
     std::raise(SIGABRT);
 }
 
 static void crash_sigsegv(int) {
     write_crash_record("SIGSEGV");
+#if defined(_WIN32)
+    write_minidump(nullptr);
+#endif
     std::signal(SIGSEGV, SIG_DFL);
     std::raise(SIGSEGV);
 }
@@ -124,6 +190,9 @@ static void crash_terminate() {
         msg = "std::terminate (unknown exception)";
     }
     write_crash_record(msg.c_str());
+#if defined(_WIN32)
+    write_minidump(nullptr);
+#endif
     std::abort();
 }
 
@@ -135,10 +204,31 @@ static void install_crash_handlers() {
         // default next to the executable's working dir
         g_crash_log_path = "kokoro-hip-server.crash.log";
     }
+#if defined(_WIN32)
+    if (const char * d = std::getenv("KOKORO_HIP_CRASH_DUMP_DIR"); d && *d) {
+        g_crash_dump_dir = d;
+    } else {
+        // Default next to the crash log (or cwd if path is a bare name).
+        auto pos = g_crash_log_path.find_last_of("\\/");
+        if (pos != std::string::npos) {
+            g_crash_dump_dir = g_crash_log_path.substr(0, pos);
+        } else {
+            g_crash_dump_dir = ".";
+        }
+    }
+    // SEH filter: catches AVs, fast-fails and heap-corruption traps before
+    // they reach WER. Registered via SetUnhandledExceptionFilter so it
+    // fires even when ttscpp's own try/catch consumed the C++ exception.
+    SetUnhandledExceptionFilter(crash_seh);
+#endif
     std::signal(SIGABRT, crash_sigabrt);
     std::signal(SIGSEGV, crash_sigsegv);
     std::set_terminate(crash_terminate);
     fprintf(stderr, "[kokoro-hip-server] crash log: %s\n", g_crash_log_path.c_str());
+#if defined(_WIN32)
+    fprintf(stderr, "[kokoro-hip-server] crash dumps: %s\n", g_crash_dump_dir.c_str());
+#endif
+    fflush(stderr);
 }
 
 // ------------------------------------------------------------

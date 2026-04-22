@@ -139,8 +139,9 @@ endif()
 # Windows needs ws2_32 / winsock linked for httplib::Server.
 # httplib's target normally handles this, but be defensive when
 # using a system header-only install.
+# dbghelp is for the MiniDumpWriteDump() crash handler in main.cpp.
 if(WIN32)
-    target_link_libraries(kokoro-hip-server PRIVATE ws2_32)
+    target_link_libraries(kokoro-hip-server PRIVATE ws2_32 dbghelp)
 endif()
 
 message(STATUS "kokoro-hip-server: executable configured")

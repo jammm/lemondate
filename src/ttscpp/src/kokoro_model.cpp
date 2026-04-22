@@ -1481,25 +1481,30 @@ int kokoro_runner::generate(std::string prompt, struct tts_response * response, 
         kctx->voice = voice;
         drunner->kctx->voice = voice;
     }
-    // Normalise Unicode dashes and ellipsis to their ASCII comma/period
-    // equivalents BEFORE any of the other rewrites run. The phonemizer's
-    // dash-handling only matches ASCII '-' (U+002D); em-dash (U+2014),
-    // en-dash (U+2013), and horizontal bar (U+2015) otherwise fall
-    // through to the "ignore it" branch, which strips them silently and
-    // leaves neighbouring words to run together with weirder prosody.
-    // Claude Code outputs plenty of em-dashes; mapping to ", " gives the
-    // model a natural pause token it was trained on.
-    kokoro_str_replace_all(prompt, "\xe2\x80\x94", ", "); // — em-dash U+2014
-    kokoro_str_replace_all(prompt, "\xe2\x80\x93", ", "); // – en-dash U+2013
-    kokoro_str_replace_all(prompt, "\xe2\x80\x95", ", "); // ― horizontal bar U+2015
-    kokoro_str_replace_all(prompt, "\xe2\x88\x92", ", "); // − minus sign U+2212
-    kokoro_str_replace_all(prompt, "\xe2\x80\xa6", "..."); // … ellipsis U+2026
-    // Smart quotes → ASCII so the apostrophe / quote handling in the
-    // phonemizer's punctuation path sees them.
-    kokoro_str_replace_all(prompt, "\xe2\x80\x99", "'");  // ’ right single quote
-    kokoro_str_replace_all(prompt, "\xe2\x80\x98", "'");  // ‘ left single quote
-    kokoro_str_replace_all(prompt, "\xe2\x80\x9c", "\""); // “ left double quote
-    kokoro_str_replace_all(prompt, "\xe2\x80\x9d", "\""); // ” right double quote
+    // Map Unicode dashes and smart quotes down to a single ASCII space
+    // each. This used to rewrite them to ", " / "'" / '"', but any path
+    // that injects extra punctuation here can propagate through the
+    // phonemizer and produce a legitimately-empty chunk in Kokoro's
+    // graph — which then hits an "invalid configuration argument" in
+    // ggml_cuda_op_bin_bcast (see the matching guard in
+    // src/ggml/src/ggml-cuda/binbcast.cu). Silently dropping the
+    // variant dashes matches the phonemizer's default behaviour for
+    // these codepoints and is the safe, crash-free version; the
+    // binbcast guard is the belt on top of these suspenders.
+    const char * kokoro_unicode_drops[] = {
+        "\xe2\x80\x94", // — em-dash U+2014
+        "\xe2\x80\x93", // – en-dash U+2013
+        "\xe2\x80\x95", // ― horizontal bar U+2015
+        "\xe2\x88\x92", // − minus sign U+2212
+        "\xe2\x80\xa6", // … ellipsis U+2026
+        "\xe2\x80\x99", // ’ right single quote
+        "\xe2\x80\x98", // ‘ left single quote
+        "\xe2\x80\x9c", // “ left double quote
+        "\xe2\x80\x9d", // ” right double quote
+    };
+    for (const char * needle : kokoro_unicode_drops) {
+        kokoro_str_replace_all(prompt, needle, " ");
+    }
 
     // replace all non-sentence terminating characters with '--' which espeak will treat as a pause.
     // We preserve the other punctuation for cleaner chunking pre-tokenization

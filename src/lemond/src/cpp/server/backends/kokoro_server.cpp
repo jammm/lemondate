@@ -258,12 +258,17 @@ void KokoroServer::load_hip(const std::string& model_name,
     }
 #endif
 
-    // Launch the subprocess
+    // Launch the subprocess. Always inherit stdout/stderr so that
+    // kokoro-hip-server's banner (HIP library path, ROCm devices,
+    // model load summary) and any crash output from its signal/SEH
+    // handlers land in lemond's own log. Otherwise the subprocess
+    // writes to NUL and we have no way to diagnose startup failures
+    // beyond "process exited with N".
     process_handle_ = utils::ProcessManager::start_process(
         exe_path,
         args,
         "",     // working_dir (empty = current)
-        is_debug(),  // inherit_output
+        true,   // inherit_output — keep child stderr visible
         false,  // filter_health_logs
         env_vars
     );

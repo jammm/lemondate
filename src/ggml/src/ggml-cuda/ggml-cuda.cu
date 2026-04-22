@@ -2979,6 +2979,25 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         GGML_LOG_ERROR("%s: %s failed\n", __func__, ggml_op_desc(dst));
+        // Dump the failing op's shape + its inputs' shapes. Without
+        // this, "invalid configuration argument" from a kernel launch
+        // is untraceable — we don't know which of the hundreds of ops
+        // in a Kokoro graph actually blew up, only which op type.
+        GGML_LOG_ERROR("  dst  name='%s' ne=[%lld,%lld,%lld,%lld] type=%s\n",
+                       dst->name ? dst->name : "",
+                       (long long) dst->ne[0], (long long) dst->ne[1],
+                       (long long) dst->ne[2], (long long) dst->ne[3],
+                       ggml_type_name(dst->type));
+        for (int i = 0; i < GGML_MAX_SRC; i++) {
+            const ggml_tensor * s = dst->src[i];
+            if (!s) continue;
+            GGML_LOG_ERROR("  src%d name='%s' ne=[%lld,%lld,%lld,%lld] type=%s\n",
+                           i,
+                           s->name ? s->name : "",
+                           (long long) s->ne[0], (long long) s->ne[1],
+                           (long long) s->ne[2], (long long) s->ne[3],
+                           ggml_type_name(s->type));
+        }
         CUDA_CHECK(err);
     }
 

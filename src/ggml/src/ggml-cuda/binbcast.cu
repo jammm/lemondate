@@ -257,6 +257,19 @@ static void launch_bin_bcast_pack(const ggml_tensor * src0, const ggml_tensor * 
         GGML_ASSERT(nb12 % sizeof(src1_t) == 0);
         GGML_ASSERT(nb13 % sizeof(src1_t) == 0);
 
+        // Bail out cleanly on empty output tensors. Without this the
+        // block_dims math below produces a 0 in .y or .z (and a divide-
+        // by-zero when computing the next dim), which then hits the CUDA
+        // launch as an "invalid configuration argument" and aborts us via
+        // CUDA_CHECK. Kokoro's graph has at least one path where an
+        // intermediate broadcast-mul can legitimately receive a
+        // zero-length sequence (e.g. an empty sentence chunk after
+        // phonemizer punctuation stripping), so "do nothing" is the
+        // correct behaviour.
+        if (ne0 == 0 || ne1 == 0 || ne2 == 0 || ne3 == 0) {
+            return;
+        }
+
         const int block_size = 128;
 
         int64_t hne0 = std::max(ne0 / 2LL, 1LL);

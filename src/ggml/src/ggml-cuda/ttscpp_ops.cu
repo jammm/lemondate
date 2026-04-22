@@ -378,6 +378,14 @@ static ttscpp_rocfft_global & ttscpp_rocfft() {
 // Prep kernel: window-apply + reflective-pad the input signal into a
 // packed [batch, n_frames, n_fft] real buffer that rocFFT can consume
 // directly as `number_of_transforms` contiguous transforms.
+//
+// frame_offset lets the host split the n_frames dimension across
+// multiple launches to stay under HIP's 65535 grid.y limit. For long
+// Kokoro outputs (>~40s of audio at n_fft=20 / hop=5) n_frames can
+// easily exceed 65535; without tiling the launch returns
+// "invalid configuration argument" and the error then surfaces on
+// whatever op's cudaGetLastError() runs next, which is maximally
+// confusing to debug.
 static __global__ void k_stft_prep(
         const float * __restrict__ src,     // [ne00, batch, ...]
         const float * __restrict__ window,  // [n_fft]
@@ -385,9 +393,10 @@ static __global__ void k_stft_prep(
         const int n_fft, const int hop, const int half,
         const int ne00,
         const int n_frames, const int batch,
-        const int src_stride_batch) {
+        const int src_stride_batch,
+        const int frame_offset) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    const int f = blockIdx.y;
+    const int f = frame_offset + (int) blockIdx.y;
     const int b = blockIdx.z;
     if (i >= n_fft || f >= n_frames || b >= batch) {
         return;
@@ -418,9 +427,10 @@ static __global__ void k_stft_post(
         float       * __restrict__ dst,
         const int n_fft, const int n_frames, const int batch,
         const int dst_stride_frame, const int dst_stride_batch, const int dst_imag_stride,
-        const int compute_abs_angle) {
+        const int compute_abs_angle,
+        const int frame_offset) {
     const int k = blockIdx.x * blockDim.x + threadIdx.x;
-    const int f = blockIdx.y;
+    const int f = frame_offset + (int) blockIdx.y;
     const int b = blockIdx.z;
     if (k >= n_fft || f >= n_frames || b >= batch) {
         return;
@@ -467,9 +477,10 @@ static __global__ void k_istft_prep(
         float       * __restrict__ prep,    // [batch*n_frames, n_fft/2+1, {re,im}] packed
         const int n_fft, const int n_frames, const int batch,
         const int src_stride_frame, const int src_stride_batch, const int src_imag_stride,
-        const int from_abs_angle) {
+        const int from_abs_angle,
+        const int frame_offset) {
     const int k    = blockIdx.x * blockDim.x + threadIdx.x;
-    const int f    = blockIdx.y;
+    const int f    = frame_offset + (int) blockIdx.y;
     const int b    = blockIdx.z;
     const int half = n_fft / 2;
     if (k > half || f >= n_frames || b >= batch) {
@@ -585,19 +596,28 @@ static void ggml_cuda_op_stft_impl(ggml_backend_cuda_context & ctx, ggml_tensor 
 
     cudaStream_t stream = ctx.stream();
 
+    // HIP grid.y is capped at 65535. Kokoro's ISTFTNet vocoder uses
+    // n_fft=20 / hop=5, which puts n_frames past this cap for anything
+    // over ~40s of audio. Tile the launch instead of clamping the
+    // input — correctness over one stage is cheap compared to wiping
+    // state and re-running.
+    const int frames_per_launch = 32768;
+
     // Stage 1: window + reflective-pad into a packed real buffer.
-    {
+    for (int f_base = 0; f_base < n_frames; f_base += frames_per_launch) {
+        const int this_tile = std::min(frames_per_launch, n_frames - f_base);
         const int block_x = 128;
         const dim3 block(block_x, 1, 1);
         const dim3 grid((n_fft + block_x - 1) / block_x,
-                        (unsigned int) n_frames,
+                        (unsigned int) this_tile,
                         (unsigned int) batch);
         k_stft_prep<<<grid, block, 0, stream>>>(
             (const float *) src0->data,
             (const float *) src1->data,
             prep.get(),
             n_fft, hop, half, ne00,
-            n_frames, batch, src_stride_batch);
+            n_frames, batch, src_stride_batch,
+            f_base);
     }
 
     // Stage 2: rocFFT real-forward transform. Plan is cached on
@@ -623,18 +643,20 @@ static void ggml_cuda_op_stft_impl(ggml_backend_cuda_context & ctx, ggml_tensor 
     ROCFFT_CHECK(rocfft_execution_info_destroy(info));
 
     // Stage 3: Hermitian-mirror + (optional) abs/angle into public layout.
-    {
+    for (int f_base = 0; f_base < n_frames; f_base += frames_per_launch) {
+        const int this_tile = std::min(frames_per_launch, n_frames - f_base);
         const int block_x = 128;
         const dim3 block(block_x, 1, 1);
         const dim3 grid((n_fft + block_x - 1) / block_x,
-                        (unsigned int) n_frames,
+                        (unsigned int) this_tile,
                         (unsigned int) batch);
         k_stft_post<<<grid, block, 0, stream>>>(
             fft.get(),
             (float *) dst->data,
             n_fft, n_frames, batch,
             dst_stride_frame, dst_stride_batch, dst_imag_stride,
-            compute_abs_angle ? 1 : 0);
+            compute_abs_angle ? 1 : 0,
+            f_base);
     }
 }
 #else // !TTSCPP_USE_ROCFFT - naive fallback kept for NVIDIA/MUSA builds
@@ -802,19 +824,27 @@ static void ggml_cuda_op_istft_impl(ggml_backend_cuda_context & ctx, ggml_tensor
 
     cudaStream_t stream = ctx.stream();
 
+    // Same grid.y tiling trick as the STFT forward path — see comment
+    // on k_stft_prep above. n_frames can exceed 65535 for any Kokoro
+    // output past ~40s of audio; without this the launch returns
+    // "invalid configuration argument" and the next op gets blamed.
+    const int frames_per_launch = 32768;
+
     // Stage 1: assemble Hermitian-symmetric complex spectrum from src.
-    {
+    for (int f_base = 0; f_base < n_frames; f_base += frames_per_launch) {
+        const int this_tile = std::min(frames_per_launch, n_frames - f_base);
         const int block_x = 128;
         const dim3 block(block_x, 1, 1);
         const dim3 grid(((half + 1) + block_x - 1) / block_x,
-                        (unsigned int) n_frames,
+                        (unsigned int) this_tile,
                         (unsigned int) batch);
         k_istft_prep<<<grid, block, 0, stream>>>(
             (const float *) src0->data,
             prep.get(),
             n_fft, n_frames, batch,
             src_stride_frame, src_stride_batch, src_imag_stride,
-            from_abs_angle ? 1 : 0);
+            from_abs_angle ? 1 : 0,
+            f_base);
     }
 
     // Stage 2: rocFFT real-inverse. Plan cached on (device, n_fft,
