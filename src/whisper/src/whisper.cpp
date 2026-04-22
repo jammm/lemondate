@@ -1349,11 +1349,15 @@ static std::vector<ggml_backend_t> whisper_backend_init(const whisper_context_pa
         }
     }
 
+    // lemondate: in GPU-only builds (GGML_CPU=OFF) there is no CPU
+    // device registered; upstream assumes one is always available and
+    // throws. We require a GPU backend instead.
     ggml_backend_t backend_cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
-    if (backend_cpu == nullptr) {
-        throw std::runtime_error("failed to initialize CPU backend");
+    if (backend_cpu != nullptr) {
+        result.push_back(backend_cpu);
+    } else if (result.empty()) {
+        throw std::runtime_error("failed to initialize any backend (no GPU or CPU device available)");
     }
-    result.push_back(backend_cpu);
 
     return result;
 }
