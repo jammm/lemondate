@@ -58,6 +58,7 @@
 #endif
 
 #include "ttscpp.h"
+#include "phonemizer.h"   // for populate_kokoro_ipa_map
 #include "kokoro_model.h" // for kokoro_runner::phonemize_with_preprocessing (used by /phonemize)
 #include "ttscommon.h"
 
@@ -574,8 +575,39 @@ static void handle_speech(kokoro_service & svc, const httplib::Request & req, ht
     res.set_content(std::string(wav_bytes.begin(), wav_bytes.end()), "audio/wav");
 }
 
+// Find the directory holding the current executable, with a trailing
+// platform separator. ttscpp's populate_kokoro_ipa_map looks up its
+// embd file as `<executable_path>embd_res/kokoro_ipa.embd`, so we
+// need the path to end in `/` (or `\`).
+static std::string get_exe_dir_with_sep() {
+#if defined(_WIN32)
+    char buf[MAX_PATH];
+    DWORD n = GetModuleFileNameA(nullptr, buf, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) return ".\\";
+    std::string p(buf, n);
+    size_t slash = p.find_last_of("\\/");
+    return slash == std::string::npos ? ".\\" : p.substr(0, slash + 1);
+#else
+    char buf[PATH_MAX];
+    ssize_t n = readlink("/proc/self/exe", buf, PATH_MAX - 1);
+    if (n <= 0) return "./";
+    buf[n] = 0;
+    std::string p(buf);
+    size_t slash = p.find_last_of('/');
+    return slash == std::string::npos ? "./" : p.substr(0, slash + 1);
+#endif
+}
+
 int main(int argc, char ** argv) {
     install_crash_handlers();
+
+    // Load the kokoro_ipa.embd front-door dictionary if it's staged
+    // alongside the binary at embd_res/kokoro_ipa.embd. This 65k-entry
+    // word->IPA override corrects most of the rule-engine bugs (plural
+    // forms mangled by the `-es` rule, etc.) without touching the
+    // model itself. Safe to call unconditionally — logs and continues
+    // if the file is missing.
+    populate_kokoro_ipa_map(get_exe_dir_with_sep());
 
     cli_opts opts;
     if (!parse_cli(argc, argv, opts)) {

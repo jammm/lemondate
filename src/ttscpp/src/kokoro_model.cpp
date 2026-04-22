@@ -1466,51 +1466,6 @@ static void kokoro_str_replace_all(std::string & s, const std::string & search, 
     s = std::move(builder);
 }
 
-// Phoneme-level corrections for words where the rule-based phonemizer
-// in ttscpp mangles the output. The root cause is a bug in the rule
-// cascade for certain `-es` / `-se` suffix patterns (e.g. "response" ->
-// "responses" mutates the root vowel, "boss" -> "bosses" loses its
-// vowel entirely, "misses" comes out without the schwa on the plural
-// syllable). The proper fix is to repair the rule tree but that's a
-// larger upstream project; meanwhile this table rewrites the worst
-// offenders after phonemization so `/voice:speak` + the Stop hook
-// sound right for the words Claude Code actually produces.
-//
-// Key = buggy phoneme sequence as observed from the phonemizer today
-// Value = hand-tuned correct IPA from reading the root's dict entry +
-// applying English plural/3sg rules.
-//
-// These are matched with leading/trailing space (or ^/$) so they don't
-// collide with substrings elsewhere.
-static const std::vector<std::pair<std::string, std::string>> KOKORO_PHONEME_FIXUPS = {
-    // -- plural `-es` cases that drop the schwa (mˈɪsz -> mˈɪsᵻz, etc.)
-    {"mˈɪsz",        "mˈɪsᵻz"},       // misses
-    {"mˈɛsz",        "mˈɛsᵻz"},       // messes
-    {"mˈæsz",        "mˈæsᵻz"},       // masses
-    {"ɡˈæsz",        "ɡˈæsᵻz"},       // gases
-    {"ɹˈoʊzz",       "ɹˈoʊzᵻz"},      // roses
-    {"lˈuːzz",       "lˈuːzᵻz"},      // loses
-    {"klˈoʊss",      "klˈoʊzᵻz"},     // closes (double-wrong: ss -> z + missing schwa)
-    {"ɪntˈɛnsz",     "ɪntˈɛnsᵻz"},    // intenses (rare, but fix anyway)
-    // -- cases where the root vowel is lost entirely (sˈɛs pattern)
-    {"ɹᵻspsˈɛs",     "ɹᵻspˈɑːnsᵻz"},  // responses
-    {"bsˈɛs",        "bˈɔːsᵻz"},      // bosses
-    {"lsˈɛs",        "lˈɔːsᵻz"},      // losses
-    {"ɐsˈɛz",        "ˈæsᵻz"},        // asses
-    {"pəzˈɛᵻz",      "pˈɔːsᵻz"},      // posses
-    {"səspsˈɛs",     "səspˈɛnsᵻz"},   // suspenses
-    // -- verb +s where the root vowel is lost (ɹᵻspdz pattern)
-    {"ɹᵻspdz",       "ɹᵻspˈɑːndz"},   // responds
-    // -- chose/chosen path gets totally wrong rule cascade
-    {"tʃˈoʊoʊsˈɛkʃu", "tʃˈoʊz"},      // chose
-};
-
-static void kokoro_apply_phoneme_fixups(std::string & phonemized) {
-    for (const auto & [bad, good] : KOKORO_PHONEME_FIXUPS) {
-        kokoro_str_replace_all(phonemized, bad, good);
-    }
-}
-
 std::string kokoro_runner::phonemize_with_preprocessing(std::string prompt) {
     // Map Unicode dashes and smart quotes down to a single ASCII space
     // each. This used to rewrite them to ", " / "'" / '"', but any path
@@ -1571,7 +1526,6 @@ std::string kokoro_runner::phonemize_with_preprocessing(std::string prompt) {
         }
         phonemized_prompt = std::move(collapsed);
     }
-    kokoro_apply_phoneme_fixups(phonemized_prompt);
     return phonemized_prompt;
 }
 

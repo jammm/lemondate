@@ -341,6 +341,16 @@ enum phonemizer_type {
 
 std::string parse_voice_code(std::string voice_code);
 void update_voice(std::string voice_code);
+
+// Populate the koboldcpp-style kokoro_ipa_map front-door override
+// dictionary. `executable_path` must end in a separator (`/` or `\`),
+// the function appends `embd_res/kokoro_ipa.embd` and parses CSV
+// rows of the form `word,IPA`. Entries here are tried before the
+// GGUF phonemizer dict and the rule cascade, so they are the
+// cleanest way to fix buggy rule-engine output for specific words.
+// Safe to call multiple times (later calls just overwrite entries).
+// Silently no-ops if the file is missing.
+void populate_kokoro_ipa_map(std::string executable_path);
 const std::unordered_set<std::string> inline_combine_sets(const std::vector<std::unordered_set<std::string>> sets);
 int upper_count(std::string word);
 bool is_all_upper(std::string word);

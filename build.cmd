@@ -208,6 +208,15 @@ if exist "C:\Strawberry\c\bin\libssh2-1__.dll" copy /y "C:\Strawberry\c\bin\libs
 REM rocFFT runtime (needed by ggml-hip for the ttscpp STFT/ISTFT path)
 if exist "%ROCM_ROOT%\bin\rocfft.dll" copy /y "%ROCM_ROOT%\bin\rocfft.dll" "%CD%\bin\" >nul 2>&1
 
+REM Kokoro IPA override dictionary — 65k entries that get hit BEFORE the
+REM rule-based phonemizer's buggy cascade, fixing most `-es` plural /
+REM `-s` 3sg / common-word mispronunciations for free. kokoro-hip-server
+REM reads this at startup via populate_kokoro_ipa_map.
+if exist "%CD%\assets\embd_res\kokoro_ipa.embd" (
+    if not exist "%CD%\bin\embd_res" mkdir "%CD%\bin\embd_res"
+    copy /y "%CD%\assets\embd_res\kokoro_ipa.embd" "%CD%\bin\embd_res\" >nul 2>&1
+)
+
 echo.
 echo [lemondate] Build complete. Binaries staged under "%CD%\bin\".
 popd
