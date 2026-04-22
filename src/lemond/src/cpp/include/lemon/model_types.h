@@ -1,0 +1,113 @@
+#pragma once
+
+#include <string>
+
+namespace lemon {
+
+// Model type classification for LRU cache management
+enum class ModelType {
+    LLM,        // Chat/completion models
+    EMBEDDING,  // Embedding models
+    RERANKING,  // Reranking models
+    AUDIO,      // Audio models (speech-to-text transcription)
+    IMAGE,      // Image generation models (text-to-image)
+    TTS         // Text to speech models
+};
+
+// Device type flags for tracking hardware usage
+// Uses bitmask pattern for models that use multiple devices
+enum DeviceType : uint32_t {
+    DEVICE_NONE = 0,
+    DEVICE_CPU  = 1 << 0,  // 0x01
+    DEVICE_GPU  = 1 << 1,  // 0x02
+    DEVICE_NPU  = 1 << 2   // 0x04
+};
+
+// Bitwise operators for DeviceType flags
+inline DeviceType operator|(DeviceType a, DeviceType b) {
+    return static_cast<DeviceType>(static_cast<uint32_t>(a) | static_cast<uint32_t>(b));
+}
+
+inline DeviceType operator&(DeviceType a, DeviceType b) {
+    return static_cast<DeviceType>(static_cast<uint32_t>(a) & static_cast<uint32_t>(b));
+}
+
+inline DeviceType& operator|=(DeviceType& a, DeviceType b) {
+    a = a | b;
+    return a;
+}
+
+// Helper functions
+inline std::string model_type_to_string(ModelType type) {
+    switch (type) {
+        case ModelType::LLM: return "llm";
+        case ModelType::EMBEDDING: return "embedding";
+        case ModelType::RERANKING: return "reranking";
+        case ModelType::AUDIO: return "audio";
+        case ModelType::IMAGE: return "image";
+        case ModelType::TTS: return "tts";
+        default: return "unknown";
+    }
+}
+
+inline std::string device_type_to_string(DeviceType device) {
+    std::string result;
+    if (device & DEVICE_CPU) {
+        if (!result.empty()) result += "|";
+        result += "cpu";
+    }
+    if (device & DEVICE_GPU) {
+        if (!result.empty()) result += "|";
+        result += "gpu";
+    }
+    if (device & DEVICE_NPU) {
+        if (!result.empty()) result += "|";
+        result += "npu";
+    }
+    if (result.empty()) result = "none";
+    return result;
+}
+
+// Determine model type from labels
+inline ModelType get_model_type_from_labels(const std::vector<std::string>& labels) {
+    for (const auto& label : labels) {
+        if (label == "embeddings" || label == "embedding") {
+            return ModelType::EMBEDDING;
+        }
+        if (label == "reranking") {
+            return ModelType::RERANKING;
+        }
+        if (label == "audio") {
+            return ModelType::AUDIO;
+        }
+        if (label == "image") {
+            return ModelType::IMAGE;
+        }
+        if (label == "tts") {
+            return ModelType::TTS;
+        }
+    }
+    return ModelType::LLM;
+}
+
+// Determine device type from recipe
+inline DeviceType get_device_type_from_recipe(const std::string& recipe) {
+    if (recipe == "llamacpp") {
+        return DEVICE_GPU;  // Default; LlamaCppServer::load() overrides to DEVICE_CPU for the cpu backend
+    } else if (recipe == "ryzenai-llm") {
+        return DEVICE_NPU;
+    } else if (recipe == "flm") {
+        return DEVICE_NPU;
+    } else if (recipe == "whispercpp") {
+        return DEVICE_CPU;  // Default; WhisperServer::load() overrides to DEVICE_NPU/DEVICE_GPU for npu/vulkan backends
+    } else if (recipe == "sd-cpp") {
+        return DEVICE_CPU;  // Default; SDServer::load() overrides to DEVICE_GPU for rocm/vulkan backends
+    } else if (recipe == "kokoro") {
+        return DEVICE_CPU;  // Kokoros runs on CPU
+    } else if (recipe == "experience") {
+        return DEVICE_NONE;  // Experience recipes orchestrate multiple component models
+    }
+    return DEVICE_NONE;
+}
+
+} // namespace lemon

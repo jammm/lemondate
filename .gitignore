@@ -1,0 +1,40 @@
+# Build output
+build/
+src/lemond/build/
+bin/
+lib/
+
+# Python venv (provisioned by ptt/install.ps1)
+venv/
+.venv/
+
+# Local model weights (users download; do not commit)
+models/
+*.gguf
+
+# IDE / OS cruft
+.vscode/settings.json
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# CMake cache / test output
+CMakeCache.txt
+CMakeFiles/
+cmake-build-*/
+compile_commands.json
+
+# Logs
+*.log
+logs/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Installer output
+dist/

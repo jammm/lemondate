@@ -1,0 +1,184 @@
+name: Linux Distro Builds 🐧
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+  merge_group:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-linux:
+    name: Build on ${{ matrix.distro }}
+    runs-on: ubuntu-latest
+    container:
+      image: ${{ matrix.image }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - distro: Arch
+            image: archlinux:latest
+            python: python
+          - distro: Debian
+            image: debian:trixie
+            python: python3
+          - distro: Fedora
+            image: fedora:latest
+            python: python3
+          - distro: openSUSE
+            image: opensuse/tumbleweed:latest
+            python: python3
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          clean: true
+          fetch-depth: 0
+
+      - name: Run setup.sh to configure environment
+        run: |
+          set -e
+
+          echo "Running setup.sh for ${{ matrix.distro }}..."
+          bash setup.sh
+
+          echo "Verifying process management tools..."
+          command -v pgrep && command -v pkill && command -v ps
+
+          echo "Verifying SSL certificates..."
+          ls -la /etc/ssl/certs/ | head -10
+
+          echo "Testing HTTPS connectivity..."
+          curl -sI https://huggingface.co | head -5 || echo "Warning: HTTPS test failed"
+
+          echo "Setup completed successfully!"
+
+      - name: Build C++ Server with CMake
+        run: |
+          set -e
+
+          echo "Building lemond and lemonade on ${{ matrix.distro }}..."
+
+          # Build
+          echo "Building binaries..."
+          cmake --build --preset default
+
+          # Verify binaries exist
+          if [ ! -f "build/lemond" ]; then
+              echo "ERROR: lemond not found!"
+              echo "Build directory contents:"
+              ls -lh build/
+              exit 1
+          fi
+
+          if [ ! -f "build/lemonade" ]; then
+              echo "ERROR: lemonade not found!"
+              echo "Build directory contents:"
+              ls -lh build/
+              exit 1
+          fi
+
+          echo "Binaries found successfully"
+          ls -lh build/lemond build/lemonade
+
+          echo "Verifying binary executability..."
+          ./build/lemond --version
+          ./build/lemonade --version
+
+          echo "${{ matrix.distro }} build successful!"
+
+      - name: Verify system library linking
+        run: |
+          echo "Checking library dependencies..."
+          cd build
+
+          echo "=== lemond dependencies ==="
+          ldd lemond
+
+          echo ""
+          echo "=== lemonade dependencies ==="
+          ldd lemonade
+
+          echo ""
+          echo "All dependencies resolved successfully on ${{ matrix.distro }}!"
+
+      - name: Setup Python virtual environment
+        run: |
+          echo "Creating Python virtual environment..."
+          if [ "${{ matrix.distro }}" = "Debian" ]; then
+              apt install -y python3-venv
+          fi
+
+          ${{ matrix.python }} -m venv .venv
+
+          echo "Activating virtual environment and installing dependencies..."
+          . .venv/bin/activate
+          pip install --upgrade pip
+          pip install -r test/requirements.txt
+
+          echo "Python environment setup complete!"
+
+      - name: Start server
+        env:
+          LEMONADE_CI_MODE: "True"
+        run: |
+          echo "Starting lemond in background..."
+          ./build/lemond --port 13305 > /tmp/lemonade-server.log 2>&1 &
+
+          echo "Waiting for server to be ready..."
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:13305/live > /dev/null 2>&1; then
+              echo "Server is running and healthy"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "ERROR: Server did not start"
+          cat /tmp/lemonade-server.log 2>/dev/null || true
+          exit 1
+
+      - name: Run CLI tests
+        env:
+          LEMONADE_CI_MODE: "True"
+          PYTHONIOENCODING: utf-8
+        run: |
+          set -e
+
+          . .venv/bin/activate
+          SERVER_BINARY="$(pwd)/build/lemonade"
+
+          echo "Running CLI tests..."
+          python test/server_cli.py --server-binary "$SERVER_BINARY"
+
+          echo "CLI tests PASSED!"
+
+      - name: Run endpoint tests
+        env:
+          LEMONADE_CI_MODE: "True"
+          PYTHONIOENCODING: utf-8
+        run: |
+          set -e
+
+          . .venv/bin/activate
+          SERVER_BINARY="$(pwd)/build/lemonade"
+
+          echo "Running endpoint tests..."
+          python test/server_endpoints.py --server-binary "$SERVER_BINARY"
+
+          echo "Endpoint tests PASSED!"
+
+      - name: Capture and upload server logs
+        if: always()
+        uses: ./.github/actions/capture-server-logs
+        with:
+          artifact-name: server-logs-distro-${{ matrix.distro }}
