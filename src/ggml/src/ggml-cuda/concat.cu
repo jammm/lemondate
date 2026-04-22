@@ -1,96 +1,132 @@
 #include "concat.cuh"
 
 // contiguous kernels
-static __global__ void concat_f32_dim0(const float * x, const float * y, float * dst, const int ne0, const int ne00) {
+//
+// All three dim0/dim1/dim2 kernels take a y_off / ne1 pair so the host
+// can tile along the ne1 dimension for tensors whose ne1 exceeds HIP's
+// 65535 grid.y cap. Kokoro's ISTFTNet decoder (n_fft=20 / hop=5)
+// produces STFT outputs with ne1 in the 60-80k range for any TTS
+// response past ~13.6s of audio, which blew up this kernel's launch
+// (grid.y = ne1) until the tiling went in. ne1 is the *full* height
+// so offset math using the ne2 stride stays correct after tiling;
+// y_off is the base index for this launch's grid.y block.
+static __global__ void concat_f32_dim0(const float * x, const float * y, float * dst,
+                                       const int ne0, const int ne00,
+                                       const int ne1, const int y_off) {
     int nidx = threadIdx.x + blockIdx.x * blockDim.x;
     if (nidx >= ne0) {
+        return;
+    }
+    // "yy" not "y" to avoid shadowing the src1 pointer argument above.
+    const int yy = y_off + (int) blockIdx.y;
+    if (yy >= ne1) {
         return;
     }
 
     int offset_dst =
         nidx +
-        blockIdx.y * ne0 +
-        blockIdx.z * ne0 * gridDim.y;
+        yy * ne0 +
+        blockIdx.z * ne0 * ne1;
 
     if (nidx < ne00) { // src0
         int offset_src =
             nidx +
-            blockIdx.y * ne00 +
-            blockIdx.z * ne00 * gridDim.y;
+            yy * ne00 +
+            blockIdx.z * ne00 * ne1;
         dst[offset_dst] = x[offset_src];
     } else {
         int offset_src =
             (nidx - ne00) +
-            blockIdx.y * (ne0 - ne00) +
-            blockIdx.z * (ne0 - ne00) * gridDim.y;
+            yy * (ne0 - ne00) +
+            blockIdx.z * (ne0 - ne00) * ne1;
         dst[offset_dst] = y[offset_src];
     }
 }
 
-static __global__ void concat_f32_dim1(const float * x, const float * y, float * dst, const int ne0, const int ne01) {
+static __global__ void concat_f32_dim1(const float * x, const float * y, float * dst,
+                                       const int ne0, const int ne01,
+                                       const int ne1, const int y_off) {
     int nidx = threadIdx.x + blockIdx.x * blockDim.x;
     if (nidx >= ne0) {
+        return;
+    }
+    const int yy = y_off + (int) blockIdx.y;
+    if (yy >= ne1) {
         return;
     }
 
     int offset_dst =
         nidx +
-        blockIdx.y * ne0 +
-        blockIdx.z * ne0 * gridDim.y;
+        yy * ne0 +
+        blockIdx.z * ne0 * ne1;
 
-    if (blockIdx.y < (unsigned)ne01) { // src0
+    if (yy < ne01) { // src0
         int offset_src =
             nidx +
-            blockIdx.y * ne0 +
+            yy * ne0 +
             blockIdx.z * ne0 * ne01;
         dst[offset_dst] = x[offset_src];
     } else {
         int offset_src =
             nidx +
-            (blockIdx.y - ne01) * ne0 +
-            blockIdx.z * ne0 * (gridDim.y - ne01);
+            (yy - ne01) * ne0 +
+            blockIdx.z * ne0 * (ne1 - ne01);
         dst[offset_dst] = y[offset_src];
     }
 }
 
-static __global__ void concat_f32_dim2(const float * x, const float * y, float * dst, const int ne0, const int ne02) {
+static __global__ void concat_f32_dim2(const float * x, const float * y, float * dst,
+                                       const int ne0, const int ne02,
+                                       const int ne1, const int y_off) {
     int nidx = threadIdx.x + blockIdx.x * blockDim.x;
     if (nidx >= ne0) {
+        return;
+    }
+    const int yy = y_off + (int) blockIdx.y;
+    if (yy >= ne1) {
         return;
     }
 
     int offset_dst =
         nidx +
-        blockIdx.y * ne0 +
-        blockIdx.z * ne0 * gridDim.y;
+        yy * ne0 +
+        blockIdx.z * ne0 * ne1;
 
     if (blockIdx.z < (unsigned)ne02) { // src0
         int offset_src =
             nidx +
-            blockIdx.y * ne0 +
-            blockIdx.z * ne0 * gridDim.y;
+            yy * ne0 +
+            blockIdx.z * ne0 * ne1;
         dst[offset_dst] = x[offset_src];
     } else {
         int offset_src =
             nidx +
-            blockIdx.y * ne0 +
-            (blockIdx.z - ne02) * ne0 *  gridDim.y;
+            yy * ne0 +
+            (blockIdx.z - ne02) * ne0 * ne1;
         dst[offset_dst] = y[offset_src];
     }
 }
 
-static void concat_f32_cuda(const float * x, const float * y, float * dst, int ne00, int ne01, int ne02, int ne0, int ne1, int ne2, int dim, cudaStream_t stream) {
-    int num_blocks = (ne0 + CUDA_CONCAT_BLOCK_SIZE - 1) / CUDA_CONCAT_BLOCK_SIZE;
-    dim3 gridDim(num_blocks, ne1, ne2);
-    if (dim == 0) {
-        concat_f32_dim0<<<gridDim, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(x, y, dst, ne0, ne00);
-        return;
+static void concat_f32_cuda(const float * x, const float * y, float * dst,
+                            int ne00, int ne01, int ne02,
+                            int ne0, int ne1, int ne2, int dim, cudaStream_t stream) {
+    const int num_blocks = (ne0 + CUDA_CONCAT_BLOCK_SIZE - 1) / CUDA_CONCAT_BLOCK_SIZE;
+    // Tile along ne1 to stay under HIP's 65535 grid.y cap.
+    const int rows_per_launch = 32768;
+    for (int y_off = 0; y_off < ne1; y_off += rows_per_launch) {
+        const int this_rows = std::min(rows_per_launch, ne1 - y_off);
+        dim3 gridDim(num_blocks, this_rows, ne2);
+        if (dim == 0) {
+            concat_f32_dim0<<<gridDim, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(
+                x, y, dst, ne0, ne00, ne1, y_off);
+        } else if (dim == 1) {
+            concat_f32_dim1<<<gridDim, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(
+                x, y, dst, ne0, ne01, ne1, y_off);
+        } else {
+            concat_f32_dim2<<<gridDim, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(
+                x, y, dst, ne0, ne02, ne1, y_off);
+        }
     }
-    if (dim == 1) {
-        concat_f32_dim1<<<gridDim, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(x, y, dst, ne0, ne01);
-        return;
-    }
-    concat_f32_dim2<<<gridDim, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(x, y, dst, ne0, ne02);
 }
 
 // non-contiguous kernel (slow)

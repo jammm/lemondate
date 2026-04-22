@@ -220,6 +220,18 @@ static void install_crash_handlers() {
     // they reach WER. Registered via SetUnhandledExceptionFilter so it
     // fires even when ttscpp's own try/catch consumed the C++ exception.
     SetUnhandledExceptionFilter(crash_seh);
+
+    // Disable Windows Error Reporting for this process. Our own SEH
+    // handler already writes a minidump (see write_minidump above), so
+    // WER's second dump pass is redundant; worse, WerFault opens a
+    // HANDLE to the dying process which keeps the HIP allocator's
+    // memory pinned for tens of seconds after exit. On a 16 GB GPU
+    // that's 4-8 GB of VRAM stuck in a zombie until WER finishes,
+    // which breaks back-to-back restarts during development.
+    SetErrorMode(SEM_NOGPFAULTERRORBOX | SEM_FAILCRITICALERRORS | SEM_NOOPENFILEERRORBOX);
+    // Also neuter the CRT's own abort() pass, which otherwise writes
+    // yet another dump via _invoke_watson.
+    _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
 #endif
     std::signal(SIGABRT, crash_sigabrt);
     std::signal(SIGSEGV, crash_sigsegv);
