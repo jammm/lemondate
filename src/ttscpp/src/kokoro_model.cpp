@@ -1466,21 +1466,52 @@ static void kokoro_str_replace_all(std::string & s, const std::string & search, 
     s = std::move(builder);
 }
 
-int kokoro_runner::generate(std::string prompt, struct tts_response * response, std::string voice, std::string voice_code) {
-	if (model->voices.find(voice) == model->voices.end()) {
-		fprintf(stdout,"\nFailed to find Kokoro voice '%s' aborting.\n", voice.c_str());
-		return -1;
-    } else {
-    	// if the language changed then we should change the phonemization voice
-    	if (phmzr->mode == ESPEAK && kctx->voice[0] != voice[0]) {
-    		if (voice_code.empty()) {
-    			voice_code = get_espeak_id_from_kokoro_voice(voice);
-    		}
-    		update_voice(voice_code);
-    	}
-        kctx->voice = voice;
-        drunner->kctx->voice = voice;
+// Phoneme-level corrections for words where the rule-based phonemizer
+// in ttscpp mangles the output. The root cause is a bug in the rule
+// cascade for certain `-es` / `-se` suffix patterns (e.g. "response" ->
+// "responses" mutates the root vowel, "boss" -> "bosses" loses its
+// vowel entirely, "misses" comes out without the schwa on the plural
+// syllable). The proper fix is to repair the rule tree but that's a
+// larger upstream project; meanwhile this table rewrites the worst
+// offenders after phonemization so `/voice:speak` + the Stop hook
+// sound right for the words Claude Code actually produces.
+//
+// Key = buggy phoneme sequence as observed from the phonemizer today
+// Value = hand-tuned correct IPA from reading the root's dict entry +
+// applying English plural/3sg rules.
+//
+// These are matched with leading/trailing space (or ^/$) so they don't
+// collide with substrings elsewhere.
+static const std::vector<std::pair<std::string, std::string>> KOKORO_PHONEME_FIXUPS = {
+    // -- plural `-es` cases that drop the schwa (mˈɪsz -> mˈɪsᵻz, etc.)
+    {"mˈɪsz",        "mˈɪsᵻz"},       // misses
+    {"mˈɛsz",        "mˈɛsᵻz"},       // messes
+    {"mˈæsz",        "mˈæsᵻz"},       // masses
+    {"ɡˈæsz",        "ɡˈæsᵻz"},       // gases
+    {"ɹˈoʊzz",       "ɹˈoʊzᵻz"},      // roses
+    {"lˈuːzz",       "lˈuːzᵻz"},      // loses
+    {"klˈoʊss",      "klˈoʊzᵻz"},     // closes (double-wrong: ss -> z + missing schwa)
+    {"ɪntˈɛnsz",     "ɪntˈɛnsᵻz"},    // intenses (rare, but fix anyway)
+    // -- cases where the root vowel is lost entirely (sˈɛs pattern)
+    {"ɹᵻspsˈɛs",     "ɹᵻspˈɑːnsᵻz"},  // responses
+    {"bsˈɛs",        "bˈɔːsᵻz"},      // bosses
+    {"lsˈɛs",        "lˈɔːsᵻz"},      // losses
+    {"ɐsˈɛz",        "ˈæsᵻz"},        // asses
+    {"pəzˈɛᵻz",      "pˈɔːsᵻz"},      // posses
+    {"səspsˈɛs",     "səspˈɛnsᵻz"},   // suspenses
+    // -- verb +s where the root vowel is lost (ɹᵻspdz pattern)
+    {"ɹᵻspdz",       "ɹᵻspˈɑːndz"},   // responds
+    // -- chose/chosen path gets totally wrong rule cascade
+    {"tʃˈoʊoʊsˈɛkʃu", "tʃˈoʊz"},      // chose
+};
+
+static void kokoro_apply_phoneme_fixups(std::string & phonemized) {
+    for (const auto & [bad, good] : KOKORO_PHONEME_FIXUPS) {
+        kokoro_str_replace_all(phonemized, bad, good);
     }
+}
+
+std::string kokoro_runner::phonemize_with_preprocessing(std::string prompt) {
     // Map Unicode dashes and smart quotes down to a single ASCII space
     // each. This used to rewrite them to ", " / "'" / '"', but any path
     // that injects extra punctuation here can propagate through the
@@ -1510,36 +1541,56 @@ int kokoro_runner::generate(std::string prompt, struct tts_response * response, 
     // We preserve the other punctuation for cleaner chunking pre-tokenization
     prompt = replace_any(prompt, ";:", "--");
     prompt = replace_any(prompt, "\n", "--");
-	kokoro_str_replace_all(prompt,"’","'");
-	kokoro_str_replace_all(prompt,"Mr. ","Mister ");
-	prompt = std::regex_replace(prompt, std::regex("(\\w)([.!?]) "), "$1$2, ");
-	kokoro_str_replace_all(prompt," - "," -- ");
-	kokoro_str_replace_all(prompt,"he's ","he is ");
-	kokoro_str_replace_all(prompt,"'s ","s ");
-	kokoro_str_replace_all(prompt,"n't ","nt ");
-	kokoro_str_replace_all(prompt,"*"," ");
-  	std::string phonemized_prompt = phmzr->text_to_phonemes(prompt);
-	// Belt-and-suspenders: collapse any remaining runs of spaces in the
-	// phonemized output down to a single space. The em-dash path in the
-	// phonemizer has been fixed to avoid emitting duplicates, but the
-	// preprocessing still routes ";", ":", "\n", and " - " through that
-	// path and anything else upstream (or future edits) could reintroduce
-	// doubles that the model then hallucinates a filler word into.
-	{
-		std::string collapsed;
-		collapsed.reserve(phonemized_prompt.size());
-		bool last_space = false;
-		for (char c : phonemized_prompt) {
-			if (c == ' ') {
-				if (!last_space) collapsed.push_back(' ');
-				last_space = true;
-			} else {
-				collapsed.push_back(c);
-				last_space = false;
-			}
-		}
-		phonemized_prompt = std::move(collapsed);
-	}
+    kokoro_str_replace_all(prompt,"’","'");
+    kokoro_str_replace_all(prompt,"Mr. ","Mister ");
+    prompt = std::regex_replace(prompt, std::regex("(\\w)([.!?]) "), "$1$2, ");
+    kokoro_str_replace_all(prompt," - "," -- ");
+    kokoro_str_replace_all(prompt,"he's ","he is ");
+    kokoro_str_replace_all(prompt,"'s ","s ");
+    kokoro_str_replace_all(prompt,"n't ","nt ");
+    kokoro_str_replace_all(prompt,"*"," ");
+    std::string phonemized_prompt = phmzr->text_to_phonemes(prompt);
+    // Belt-and-suspenders: collapse any remaining runs of spaces in the
+    // phonemized output down to a single space. The em-dash path in the
+    // phonemizer has been fixed to avoid emitting duplicates, but the
+    // preprocessing still routes ";", ":", "\n", and " - " through that
+    // path and anything else upstream (or future edits) could reintroduce
+    // doubles that the model then hallucinates a filler word into.
+    {
+        std::string collapsed;
+        collapsed.reserve(phonemized_prompt.size());
+        bool last_space = false;
+        for (char c : phonemized_prompt) {
+            if (c == ' ') {
+                if (!last_space) collapsed.push_back(' ');
+                last_space = true;
+            } else {
+                collapsed.push_back(c);
+                last_space = false;
+            }
+        }
+        phonemized_prompt = std::move(collapsed);
+    }
+    kokoro_apply_phoneme_fixups(phonemized_prompt);
+    return phonemized_prompt;
+}
+
+int kokoro_runner::generate(std::string prompt, struct tts_response * response, std::string voice, std::string voice_code) {
+	if (model->voices.find(voice) == model->voices.end()) {
+		fprintf(stdout,"\nFailed to find Kokoro voice '%s' aborting.\n", voice.c_str());
+		return -1;
+    } else {
+    	// if the language changed then we should change the phonemization voice
+    	if (phmzr->mode == ESPEAK && kctx->voice[0] != voice[0]) {
+    		if (voice_code.empty()) {
+    			voice_code = get_espeak_id_from_kokoro_voice(voice);
+    		}
+    		update_voice(voice_code);
+    	}
+        kctx->voice = voice;
+        drunner->kctx->voice = voice;
+    }
+    std::string phonemized_prompt = phonemize_with_preprocessing(std::move(prompt));
 
   	// Kokoro users a utf-8 single character tokenizer so if the size of the prompt is smaller than the max context length without the
   	// beginning of sentence and end of sentence tokens then we can compute it all at once.

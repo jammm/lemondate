@@ -58,6 +58,7 @@
 #endif
 
 #include "ttscpp.h"
+#include "kokoro_model.h" // for kokoro_runner::phonemize_with_preprocessing (used by /phonemize)
 #include "ttscommon.h"
 
 using json = nlohmann::json;
@@ -449,6 +450,27 @@ struct kokoro_service {
         return true;
     }
 
+    // Debug aid: run the same preprocessing + phonemizer that `generate()`
+    // does, but don't run inference. Returns the IPA string that the
+    // Kokoro tokenizer will see. Used by the /phonemize endpoint to
+    // diagnose word-level mispronunciations without spending the time
+    // (and audio) of a full synthesis round-trip.
+    int phonemize_only(const std::string & text, std::string & out, std::string & err) {
+        if (!runner) {
+            err = "model not loaded";
+            return 1;
+        }
+        // tts_runner has no virtuals so no dynamic_cast; we already
+        // verified runner->arch == KOKORO_ARCH in load() above so this
+        // static downcast is sound.
+        auto * kr = static_cast<kokoro_runner *>(runner);
+        // phonemize_with_preprocessing mutates its argument by value,
+        // so hand it a copy.
+        std::lock_guard<std::mutex> lock(inference_mu);
+        out = kr->phonemize_with_preprocessing(text);
+        return 0;
+    }
+
     // Returns 0 on success. Populates `wav_out`. On failure, fills `err`.
     int synthesize(const std::string & text,
                    const std::string & voice,
@@ -596,6 +618,47 @@ int main(int argc, char ** argv) {
     });
     server.Post("/api/extra/tts", [&svc](const httplib::Request & req, httplib::Response & res) {
         handle_speech(svc, req, res);
+    });
+
+    // Diagnostic endpoint: returns the IPA phoneme string Kokoro will
+    // see for a given input, after all the kokoro_runner preprocessing
+    // (contraction expansion, Unicode drop, punctuation normalisation)
+    // runs. Useful for chasing word-level mispronunciations without
+    // burning a full synthesis.
+    //
+    //   curl -X POST http://127.0.0.1:8001/phonemize \
+    //        -H 'Content-Type: application/json' \
+    //        -d '{"input":"responses"}'
+    //   -> {"input":"responses","phonemes":"..."}
+    server.Post("/phonemize", [&svc](const httplib::Request & req, httplib::Response & res) {
+        json body;
+        try { body = json::parse(req.body); }
+        catch (const std::exception & e) {
+            send_json_error(res, 400, std::string("invalid JSON body: ") + e.what());
+            return;
+        }
+        std::string text;
+        if (body.contains("input") && body["input"].is_string()) {
+            text = body["input"].get<std::string>();
+        } else if (body.contains("text") && body["text"].is_string()) {
+            text = body["text"].get<std::string>();
+        }
+        if (text.empty()) {
+            send_json_error(res, 400, "missing or empty 'input' field");
+            return;
+        }
+        std::string phonemes, err;
+        int rc = svc.phonemize_only(text, phonemes, err);
+        if (rc != 0) {
+            send_json_error(res, 500, err.empty() ? "phonemize failed" : err);
+            return;
+        }
+        json j;
+        j["input"]    = text;
+        j["phonemes"] = phonemes;
+        j["n_chars"]  = (int) phonemes.size();
+        res.status = 200;
+        res.set_content(j.dump(), "application/json");
     });
 
     server.set_logger([](const httplib::Request & req, const httplib::Response & res) {

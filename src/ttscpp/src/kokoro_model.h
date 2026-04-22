@@ -468,6 +468,13 @@ struct kokoro_runner : tts_runner {
     void set_inputs(kokoro_ubatch & batch, uint32_t total_size);
     struct ggml_cgraph * build_kokoro_graph(kokoro_ubatch & batch);
     void run(kokoro_ubatch & batch, struct tts_response * outputs);
+    // Run the same text preprocessing + phonemizer pass that generate()
+    // uses, without building the graph. Useful for debugging word-level
+    // mispronunciations: given `generate()` does the rewrites below
+    // (contraction expansion, punctuation normalisation, etc.) in a
+    // single place, this exposes that output as a pure string so a
+    // /phonemize endpoint / tools / tests can inspect it directly.
+    std::string phonemize_with_preprocessing(std::string prompt);
     int generate(std::string prompt, struct tts_response * response, std::string voice, std::string voice_code = "");
 };
 
