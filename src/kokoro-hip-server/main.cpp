@@ -24,10 +24,14 @@
 // ============================================================
 
 #include <algorithm>
+#include <atomic>
+#include <csignal>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
+#include <exception>
 #include <fstream>
 #include <mutex>
 #include <stdexcept>
@@ -42,6 +46,100 @@
 #include "ttscommon.h"
 
 using json = nlohmann::json;
+
+// ------------------------------------------------------------
+// Crash diagnostics. ttscpp's TTS_ABORT/TTS_ASSERT macros call
+// std::abort(), which on Windows ends up as __fastfail(7) =
+// FAST_FAIL_FATAL_APP_EXIT and gets logged as
+// "Exception Code c0000409 subcode 7" in WER but without the
+// ttscpp abort message surviving to where we can read it (lemond
+// doesn't pipe the subprocess stderr to its own log reliably).
+//
+// g_last_request is a best-effort last-known-input snapshot, and
+// install_crash_handlers() traps SIGABRT / std::terminate /
+// unhandled exceptions so we can dump the text + a marker to a
+// file *before* the CRT fast-fails us out.
+// ------------------------------------------------------------
+static std::mutex g_last_mu;
+static std::string g_last_text;
+static std::string g_last_voice;
+static std::string g_crash_log_path;
+
+static void write_crash_record(const char * reason) {
+    std::string snap_text, snap_voice;
+    {
+        std::lock_guard<std::mutex> lk(g_last_mu);
+        snap_text = g_last_text;
+        snap_voice = g_last_voice;
+    }
+    fprintf(stderr,
+        "\n[kokoro-hip-server CRASH] %s\n"
+        "  last_voice=%s\n"
+        "  last_text_len=%zu\n"
+        "  last_text=%s\n",
+        reason, snap_voice.c_str(), snap_text.size(), snap_text.c_str());
+    fflush(stderr);
+
+    if (!g_crash_log_path.empty()) {
+        if (FILE * f = fopen(g_crash_log_path.c_str(), "a")) {
+            std::time_t t = std::time(nullptr);
+            char ts[64];
+            std::strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", std::localtime(&t));
+            fprintf(f,
+                "[%s] %s\n"
+                "  voice=%s\n"
+                "  text_len=%zu\n"
+                "  text=%s\n"
+                "  text_hex=",
+                ts, reason, snap_voice.c_str(), snap_text.size(), snap_text.c_str());
+            for (unsigned char c : snap_text) fprintf(f, "%02x", (unsigned)c);
+            fprintf(f, "\n\n");
+            fclose(f);
+        }
+    }
+}
+
+static void crash_sigabrt(int) {
+    write_crash_record("SIGABRT");
+    std::signal(SIGABRT, SIG_DFL);
+    std::raise(SIGABRT);
+}
+
+static void crash_sigsegv(int) {
+    write_crash_record("SIGSEGV");
+    std::signal(SIGSEGV, SIG_DFL);
+    std::raise(SIGSEGV);
+}
+
+static void crash_terminate() {
+    const char * reason = "std::terminate";
+    std::string msg = reason;
+    try {
+        if (auto eptr = std::current_exception()) {
+            std::rethrow_exception(eptr);
+        }
+    } catch (const std::exception & e) {
+        msg = std::string("std::terminate (what=") + e.what() + ")";
+    } catch (...) {
+        msg = "std::terminate (unknown exception)";
+    }
+    write_crash_record(msg.c_str());
+    std::abort();
+}
+
+static void install_crash_handlers() {
+    const char * env = std::getenv("KOKORO_HIP_CRASH_LOG");
+    if (env && *env) {
+        g_crash_log_path = env;
+    } else {
+        // default next to the executable's working dir
+        g_crash_log_path = "kokoro-hip-server.crash.log";
+    }
+    std::signal(SIGABRT, crash_sigabrt);
+    std::signal(SIGSEGV, crash_sigsegv);
+    std::set_terminate(crash_terminate);
+    fprintf(stderr, "[kokoro-hip-server] crash log: %s\n", g_crash_log_path.c_str());
+}
 
 // ------------------------------------------------------------
 // CLI options (simple custom parser — CLI11 is overkill for 4
@@ -260,6 +358,16 @@ struct kokoro_service {
         }
         std::lock_guard<std::mutex> lock(inference_mu);
 
+        // Snapshot for the crash handlers. TTS_ABORT / TTS_ASSERT inside
+        // ttscpp can invoke std::abort() which on Windows becomes a
+        // fast-fail with no surviving stderr. If we crash mid-generate,
+        // the crash log tells us exactly what text + voice tripped it.
+        {
+            std::lock_guard<std::mutex> lk(g_last_mu);
+            g_last_text = text;
+            g_last_voice = voice.empty() ? default_voice : voice;
+        }
+
         // Re-point the runner's config to the request's voice.
         generation_configuration config(voice.empty() ? default_voice : voice);
 
@@ -343,6 +451,8 @@ static void handle_speech(kokoro_service & svc, const httplib::Request & req, ht
 }
 
 int main(int argc, char ** argv) {
+    install_crash_handlers();
+
     cli_opts opts;
     if (!parse_cli(argc, argv, opts)) {
         return 2;
