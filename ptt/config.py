@@ -84,9 +84,15 @@ EOU_ENERGY_THRESHOLD = int(os.environ.get("EOU_ENERGY_THRESHOLD", "350"))
 
 # Whisper hallucinates badly on clips under ~1 s — 300-700 ms of audio
 # typically decodes to one of a few stock phrases ("Thank you.", "All
-# right.", "Bye.", "You."). Drop anything shorter and pad still-short
-# clips up to MIN_PAD_MS total by wrapping them in silence, which
-# regularizes Whisper's 30 s attention window for short inputs.
+# right.", "Bye.", "You."). Drop anything shorter (wake path only — see
+# below) and pad still-short clips up to MIN_PAD_MS total by wrapping
+# them in silence, which regularizes Whisper's 30 s attention window
+# for short inputs.
+#
+# MIN_CLIP_MS only gates the wake path now. PTT is explicit user intent
+# (F9 was pressed), so single-word utterances like "yo" (~200 ms) have
+# to go through. Wake still drops sub-threshold clips to avoid
+# transcribing every ambient noise burst.
 MIN_CLIP_MS = int(os.environ.get("MIN_CLIP_MS", "700"))
 MIN_PAD_MS = int(os.environ.get("MIN_PAD_MS", "2000"))
 

@@ -148,13 +148,19 @@ class Recorder:
             audio.size,
             duration_ms,
         )
-        if duration_ms < config.MIN_CLIP_MS:
+        # MIN_CLIP_MS only gates the wake path. A direct PTT press is
+        # explicit user intent — if they held F9 to say "yo" (~200 ms),
+        # we should transcribe it. Wake recordings, on the other hand,
+        # can fire on HVAC / keyboard clicks / chair creaks and Whisper
+        # hallucinates those into stock phrases; the floor keeps those
+        # noise bursts out.
+        if source != "ptt" and duration_ms < config.MIN_CLIP_MS:
             log.info("skipping transcribe, clip too short (%.0f ms < %d)",
                      duration_ms, config.MIN_CLIP_MS)
             return
         # Pad still-short clips with silence on both sides so Whisper's
         # 30 s attention window gets something structurally resembling a
-        # normal utterance. Without this, 0.8-1.5 s clips routinely
+        # normal utterance. Without this, 0.2-1.5 s clips routinely
         # decode to stock phrases like "Thank you." instead of the
         # actual words.
         if duration_ms < config.MIN_PAD_MS:
