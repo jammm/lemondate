@@ -1,15 +1,20 @@
 # ============================================================
 # src/ttscpp/CMakeLists.txt
 #
-# Builds the ttscpp static library (Kokoro / Parler / Dia /
-# Orpheus TTS inference on top of ggml).
+# Builds the ttscpp static library — Kokoro TTS inference on
+# top of ggml. Lemondate ships Kokoro as the only TTS model,
+# so the Parler / Dia / Orpheus / (t5/dac/snac/general_neural_
+# audio_codec) sources that were originally vendored alongside
+# Kokoro have been deleted. The remaining sources assume a
+# GPU-only ggml (GGML_CPU=OFF) and never call into the CPU
+# compute backend.
 #
-# Source is vendored verbatim from koboldcpp/otherarch/ttscpp/
-# (see README / plan for the commit it was pulled from). The
-# upstream tree has no CMakeLists of its own — koboldcpp builds
-# it via a unity-include pattern in otherarch/tts_adapter.cpp.
-# We build each .cpp as a real translation unit here so that
-# lemond's kokoro-hip-server.exe can link the library cleanly.
+# Source was vendored from koboldcpp/otherarch/ttscpp/ (see
+# README / plan for the commit it was pulled from). Upstream
+# has no CMakeLists of its own — koboldcpp builds it via a
+# unity-include pattern in otherarch/tts_adapter.cpp. We build
+# each .cpp as a real translation unit here so that lemond's
+# kokoro-hip-server.exe can link the library cleanly.
 #
 # The target is called `ttscpp` and links PUBLIC to `ggml`
 # (provided by src/ggml/CMakeLists.txt, which is added before
@@ -22,18 +27,11 @@ if(NOT DEFINED CMAKE_CXX_STANDARD)
 endif()
 
 set(TTSCPP_SOURCES
-    src/dac_model.cpp
-    src/dia_model.cpp
-    src/general_neural_audio_codec.cpp
     src/kokoro_model.cpp
-    src/orpheus_model.cpp
-    src/parler_model.cpp
     src/phonemizer.cpp
-    src/snac_model.cpp
     src/ttsargs.cpp
     src/ttscpp.cpp
     src/ttssampler.cpp
-    src/ttst5_encoder_model.cpp
     src/ttstokenizer.cpp
     src/ttsutil.cpp
     src/tts_model.cpp

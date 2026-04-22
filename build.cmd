@@ -5,50 +5,88 @@ REM
 REM Builds all four C++ targets from a single invocation:
 REM   1. src/ggml + src/ttscpp + src/whisper + src/kokoro-hip-server
 REM      (the HIP-accelerated voice stack) via the TOP-LEVEL
-REM      CMakeLists at d:\jam\lemondate\CMakeLists.txt. Output
-REM      binaries go to build\bin\.
+REM      CMakeLists.txt. Output binaries go to build\bin\.
 REM   2. src/lemond (the lemonade HTTP orchestrator) via its own
-REM      CMakeLists at src\lemond\CMakeLists.txt. Output binaries
-REM      go to src\lemond\build\bin\.
+REM      CMakeLists.txt at src\lemond\CMakeLists.txt. Output
+REM      binaries go to src\lemond\build\bin\.
 REM
 REM After both succeed we stage every produced .exe/.dll into
 REM d:\jam\lemondate\bin\ so the shims in this repo's sister
 REM tts_tts_claude_code installer can find them via a single
 REM LemondatePath argument.
 REM
-REM Prereqs:
-REM   - VS 2022 x64 Developer PowerShell / Command Prompt on PATH
-REM   - TheRock ROCm SDK installed into the python venv at %VENV%
-REM     (default d:\jam\demos\.venv); CMake picks up its clang
-REM     toolchain automatically.
+REM Usage:
+REM   build.cmd                     full configure+build
+REM   build.cmd configure           configure only (fast smoke test)
+REM   build.cmd clean                wipe build dirs and exit
 REM
 REM Environment overrides:
 REM   GFX_TARGET      default gfx1201 (semicolon-separated list
 REM                   ok, e.g. gfx1151;gfx1201)
 REM   VENV_ROOT       default d:\jam\demos\.venv
 REM   BUILD_DIR       default %CD%\build
+REM   VS_VCVARS       path to vcvars64.bat (default VS 2022
+REM                   Community install)
 REM ============================================================
 
-setlocal ENABLEEXTENSIONS
+setlocal ENABLEEXTENSIONS ENABLEDELAYEDEXPANSION
 pushd "%~dp0"
 
-if "%GFX_TARGET%"=="" set GFX_TARGET=gfx1201
-if "%VENV_ROOT%"=="" set VENV_ROOT=d:\jam\demos\.venv
-if "%BUILD_DIR%"=="" set BUILD_DIR=%CD%\build
+if "%GFX_TARGET%"=="" set "GFX_TARGET=gfx1201"
+if "%VENV_ROOT%"=="" set "VENV_ROOT=d:\jam\demos\.venv"
+if "%BUILD_DIR%"=="" set "BUILD_DIR=%CD%\build"
+if "%VS_VCVARS%"=="" set "VS_VCVARS=C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"
 
-set ROCM_ROOT=%VENV_ROOT%\Lib\site-packages\_rocm_sdk_devel
-set ROCM_CLANG=%ROCM_ROOT%\lib\llvm\bin
+set "ROCM_ROOT=%VENV_ROOT%\Lib\site-packages\_rocm_sdk_devel"
+set "ROCM_CLANG=%ROCM_ROOT%\lib\llvm\bin"
 
+REM --- sanity: TheRock ROCm SDK ---
 if not exist "%ROCM_CLANG%\clang.exe" (
-    echo [lemondate] ERROR: could not find clang.exe at "%ROCM_CLANG%".
-    echo             Install TheRock ROCm SDK into the venv first:
-    echo               pip install --index-url https://rocm.nightlies.amd.com/v2/gfx120X-all/ torch "rocm[libraries,devel]"
+    echo [lemondate] ERROR: clang.exe not at "%ROCM_CLANG%".
+    echo             Run: pip install --index-url https://rocm.nightlies.amd.com/v2/gfx120X-all/ torch "rocm[libraries,devel]"
     exit /b 1
+)
+
+REM --- sanity: VS 2022 x64 env (for rc.exe, Windows SDK headers, link.exe) ---
+if not exist "%VS_VCVARS%" (
+    echo [lemondate] ERROR: vcvars64.bat not at "%VS_VCVARS%".
+    echo             Install Visual Studio 2022 + "Desktop development with C++" workload,
+    echo             or set VS_VCVARS to your local vcvars64.bat.
+    exit /b 1
+)
+
+REM --- clean mode ---
+if "%1"=="clean" (
+    echo [lemondate] cleaning "%BUILD_DIR%" and "%CD%\src\lemond\build"
+    rmdir /s /q "%BUILD_DIR%" 2>nul
+    rmdir /s /q "%CD%\src\lemond\build" 2>nul
+    echo [lemondate] clean done.
+    popd
+    endlocal
+    exit /b 0
 )
 
 echo [lemondate] GFX_TARGET = %GFX_TARGET%
 echo [lemondate] VENV_ROOT  = %VENV_ROOT%
+echo [lemondate] ROCM_ROOT  = %ROCM_ROOT%
 echo [lemondate] BUILD_DIR  = %BUILD_DIR%
+echo [lemondate] VS_VCVARS  = %VS_VCVARS%
+echo.
+
+REM --- Load VS 2022 x64 environment (brings rc.exe + link.exe + SDK headers) ---
+echo [lemondate] loading vcvars64...
+call "%VS_VCVARS%" >nul
+if errorlevel 1 (
+    echo [lemondate] ERROR: vcvars64 failed
+    exit /b 1
+)
+
+REM --- HIP env the way koboldcpp + whisper builds expect it ---
+set "HIP_PATH=%ROCM_ROOT%"
+set "HIP_PLATFORM=amd"
+set "HIP_CLANG_PATH=%ROCM_CLANG%"
+set "CMAKE_PREFIX_PATH=%ROCM_ROOT%\lib\cmake;%ROCM_ROOT%"
+set "PATH=%ROCM_ROOT%\bin;%ROCM_CLANG%;%PATH%"
 
 REM ------------------------------------------------------------
 REM Step 1: top-level HIP stack (ggml / ttscpp / whisper / kokoro-hip-server)
@@ -60,9 +98,31 @@ cmake -S . -B "%BUILD_DIR%" ^
     -DCMAKE_BUILD_TYPE=Release ^
     -DCMAKE_C_COMPILER="%ROCM_CLANG%\clang.exe" ^
     -DCMAKE_CXX_COMPILER="%ROCM_CLANG%\clang++.exe" ^
+    -DCMAKE_PREFIX_PATH="%ROCM_ROOT%\lib\cmake;%ROCM_ROOT%" ^
+    -DGGML_HIP=ON ^
+    -DGGML_HIP_ROCWMMA_FATTN=OFF ^
+    -DGGML_CPU=OFF ^
+    -DGGML_BLAS=OFF ^
+    -DGGML_METAL=OFF ^
+    -DGGML_OPENCL=OFF ^
+    -DGGML_VULKAN=OFF ^
+    -DGGML_WEBGPU=OFF ^
+    -DGGML_HEXAGON=OFF ^
+    -DGGML_BACKEND_DL=OFF ^
     -DGFX_TARGET="%GFX_TARGET%" ^
+    -DGPU_TARGETS="%GFX_TARGET%" ^
+    -DAMDGPU_TARGETS="%GFX_TARGET%" ^
+    -DCMAKE_HIP_ARCHITECTURES="%GFX_TARGET%" ^
     -DCMAKE_SYSTEM_VERSION="10.0.26100.0"
 if errorlevel 1 goto :fail
+
+if "%1"=="configure" (
+    echo.
+    echo [lemondate] configure-only mode: skipping build.
+    popd
+    endlocal
+    exit /b 0
+)
 
 echo.
 echo [lemondate] === Building top-level HIP stack ===
@@ -72,14 +132,22 @@ if errorlevel 1 goto :fail
 REM ------------------------------------------------------------
 REM Step 2: lemond (lemonade HTTP orchestrator)
 REM ------------------------------------------------------------
-set LEMOND_SRC=%CD%\src\lemond
-set LEMOND_BUILD=%LEMOND_SRC%\build
+set "LEMOND_SRC=%CD%\src\lemond"
+set "LEMOND_BUILD=%LEMOND_SRC%\build"
 
 echo.
 echo [lemondate] === Configuring lemond ===
+REM lemond is a plain CPU HTTP server. It does not need HIP/ROCm
+REM toolchain. Use real MSVC cl.exe (from vcvars64 above) so the
+REM /MT, /Zc:preprocessor, and other MSVC-specific flags that
+REM lemonade + libwebsockets/curl use don't trip up clang-cl's
+REM stricter handling.
 cmake -S "%LEMOND_SRC%" -B "%LEMOND_BUILD%" ^
     -G Ninja ^
-    -DCMAKE_BUILD_TYPE=Release
+    -DCMAKE_BUILD_TYPE=Release ^
+    -DCMAKE_C_COMPILER=cl.exe ^
+    -DCMAKE_CXX_COMPILER=cl.exe ^
+    -DCMAKE_SYSTEM_VERSION="10.0.26100.0"
 if errorlevel 1 goto :fail
 
 echo.
@@ -94,22 +162,12 @@ echo.
 echo [lemondate] === Staging bin\ ===
 if not exist "%CD%\bin" mkdir "%CD%\bin"
 
-REM Top-level artefacts
-if exist "%BUILD_DIR%\bin\whisper-server.exe" (
-    copy /y "%BUILD_DIR%\bin\whisper-server.exe" "%CD%\bin\" >nul
-)
-if exist "%BUILD_DIR%\bin\kokoro-hip-server.exe" (
-    copy /y "%BUILD_DIR%\bin\kokoro-hip-server.exe" "%CD%\bin\" >nul
-)
+if exist "%BUILD_DIR%\bin\whisper-server.exe"     copy /y "%BUILD_DIR%\bin\whisper-server.exe" "%CD%\bin\" >nul
+if exist "%BUILD_DIR%\bin\kokoro-hip-server.exe"  copy /y "%BUILD_DIR%\bin\kokoro-hip-server.exe" "%CD%\bin\" >nul
 for %%F in ("%BUILD_DIR%\bin\*.dll") do copy /y "%%F" "%CD%\bin\" >nul 2>&1
 
-REM lemond artefacts
-if exist "%LEMOND_BUILD%\bin\lemond.exe" (
-    copy /y "%LEMOND_BUILD%\bin\lemond.exe" "%CD%\bin\" >nul
-)
-if exist "%LEMOND_BUILD%\bin\lemonade.exe" (
-    copy /y "%LEMOND_BUILD%\bin\lemonade.exe" "%CD%\bin\" >nul
-)
+if exist "%LEMOND_BUILD%\bin\lemond.exe"    copy /y "%LEMOND_BUILD%\bin\lemond.exe" "%CD%\bin\" >nul
+if exist "%LEMOND_BUILD%\bin\lemonade.exe"  copy /y "%LEMOND_BUILD%\bin\lemonade.exe" "%CD%\bin\" >nul
 for %%F in ("%LEMOND_BUILD%\bin\*.dll") do copy /y "%%F" "%CD%\bin\" >nul 2>&1
 
 echo.

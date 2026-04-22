@@ -597,6 +597,7 @@ extern "C" {
         GGML_OP_AA_ISTFT,
         GGML_OP_CONV_TRANSPOSE_1D_TTS,
         GGML_OP_SNAKE_1D, // x + sin^2(x * alpha) / alpha — fused snake activation
+        GGML_OP_UV_NOISE, // Kokoro voiced/unvoiced gate + noise (replaces map_custom3)
     };
 
     enum ggml_unary_op {
@@ -2920,6 +2921,28 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
             int                   scale_factor);
+    // Fused Kokoro voiced/unvoiced gate + noise generator. Replaces a
+    // ggml_map_custom3 call that forced the surrounding generator
+    // subgraph to CPU and inserted a GPU->host->GPU bounce per token.
+    //
+    //   fake   : 3D F32 tensor [sequence_length, harmonic_num, 2] —
+    //            only its shape is consumed; contents are unused.
+    //   gate   : 1D F32 [sequence_length] — the upscaled f0 curve.
+    //            voiced iff gate[r] > threshold (threshold is in
+    //            params[0]).
+    //   params : I32 tensor of length sequence_length*harmonic_num + 4.
+    //            params[0..3] are bit-cast floats (voice_threshold,
+    //            noise_std, sin_amp, sin_amp_div); params[4..] are
+    //            per-cell random noise values reinterpreted as float.
+    //
+    // Output shape matches `fake`:
+    //   dst[:, :, 0] = sin_amp (voiced) / 0      (unvoiced)
+    //   dst[:, :, 1] = noise_std*rand (voiced) / sin_amp_div*rand (unvoiced)
+    GGML_API struct ggml_tensor * ggml_uv_noise(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * fake,
+            struct ggml_tensor  * gate,
+            struct ggml_tensor  * params);
     //end kcpp dirtypatch
 
 #ifdef  __cplusplus

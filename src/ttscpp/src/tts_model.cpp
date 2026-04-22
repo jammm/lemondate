@@ -1,6 +1,5 @@
 #include "tts_model.h"
 #include "ggml-backend.h"
-#include "ggml-cpu.h"
 
 void append_to_response(struct tts_response * response, struct tts_response * to_append) {
     float * new_data = (float *) malloc((response->n_outputs + to_append->n_outputs) * sizeof(float));
@@ -33,34 +32,34 @@ void runner_context::get_ggml_node_data(struct ggml_tensor * output_node, float 
 }
 
 void runner_context::set_threads() {
-    if (backend != nullptr) {
-
-    }
-    if (backend_cpu != nullptr) {
-        ggml_backend_cpu_set_n_threads(backend_cpu, n_threads);
-        struct ggml_threadpool_params ttp = ggml_threadpool_params_default(n_threads);
-        threadpool = ggml_threadpool_new(&ttp);
-        ggml_backend_cpu_set_threadpool(backend_cpu, threadpool);
-    }
+    // No-op in lemondate: thread-pool + thread-count management is
+    // part of the ggml CPU compute backend, which this build does not
+    // link against (GGML_CPU=OFF). All compute runs on the HIP/CUDA
+    // backend; anything that needs threads uses the GPU device queue.
 }
 
 void runner_context::build_schedule(size_t max_nodes) {
+    // `backend_cpu_buffer` is a host-memory buffer *type* descriptor
+    // (ggml-base, not ggml-cpu) used by prep_output_buffer() and by
+    // the kokoro runner to allocate the final audio-sample readback
+    // buffer. It does not require the CPU compute backend. If the
+    // linker rejects ggml_backend_cpu_buffer_type with GGML_CPU=OFF
+    // the fallback is ggml_backend_cuda_host_buffer_type(0), which
+    // ships with ggml-cuda / ggml-hip.
     backend_cpu_buffer = ggml_backend_cpu_buffer_type();
-    if (backend != nullptr) {
-        std::vector<ggml_backend_buffer_type_t> bufs = {backend_buffer, backend_cpu_buffer};
-        std::vector<ggml_backend_t> backs = {backend, backend_cpu};
-        // op_offload=true: tells the scheduler to push large matmuls
-        // off CPU and onto the primary (GPU) backend even when their
-        // inputs sit on CPU. For Kokoro this matters for the duration
-        // predictor + AdaIN convs that consume style/embedding tensors
-        // staged from CPU; without offload the scheduler keeps them on
-        // CPU and the GPU contributes nothing.
-        sched = ggml_backend_sched_new(backs.data(), bufs.data(), 2, max_nodes, false, true);
-    } else {
-        std::vector<ggml_backend_buffer_type_t> bufs = {backend_cpu_buffer};
-        std::vector<ggml_backend_t> backs = {backend_cpu};
-        sched = ggml_backend_sched_new(backs.data(), bufs.data(), 1, max_nodes, false, false);
-    }
+    // GPU-only scheduler. Lemondate builds ggml with GGML_CPU=OFF so
+    // there is no CPU compute backend to register as a fallback. The
+    // `backend` member must be set to a HIP/CUDA backend by the owner
+    // (kokoro_from_file wires model->backend and hands it to every
+    // runner_context) before build_schedule runs.
+    TTS_ASSERT(backend != nullptr);
+    std::vector<ggml_backend_buffer_type_t> bufs = {backend_buffer};
+    std::vector<ggml_backend_t> backs = {backend};
+    // op_offload=true: push large matmuls onto the primary backend
+    // even when their inputs are placed elsewhere. With a single GPU
+    // backend this is effectively a no-op for placement but keeps the
+    // scheduler behavior consistent with the previous CPU+GPU setup.
+    sched = ggml_backend_sched_new(backs.data(), bufs.data(), 1, max_nodes, false, true);
 }
 
 bool runner_context::prep_schedule(struct ggml_cgraph * gf) {
@@ -98,15 +97,19 @@ void tts_runner::free_build() {
 }
 
 void tts_model::prep_buffers_and_context(bool cpu_only, float size_offset, uint32_t dedicated_add_on_size) {
-    // currently DAC is only supported on cpu because the ops are not implemented on other devices;
+    // Lemondate ships a GPU-only ttscpp. `cpu_only=true` was the path
+    // that called ggml_backend_cpu_init() / ggml_backend_cpu_buffer_
+    // type() — both live in the ggml CPU compute backend which this
+    // build does not include (GGML_CPU=OFF). There is therefore no
+    // sensible CPU fallback and we abort rather than silently produce
+    // a model with a null backend.
     if (cpu_only) {
-        backend = ggml_backend_cpu_init();
-        buffer = ggml_backend_cpu_buffer_type();
-    } else {
-        // if use metal is not installed then we need to warn here
-        if (!backend || !buffer) {
-            TTS_ABORT("'GGML_USE_METAL' is not defined either set the model to use CPU only or install ggml with metal support.");
-        }
+        TTS_ABORT("ttscpp was built GPU-only (GGML_CPU=OFF); cpu_only=true is not supported. "
+                  "Set cpu_only=false and ensure kokoro_from_file wired model->backend to a HIP/CUDA backend.");
+    }
+    if (!backend || !buffer) {
+        TTS_ABORT("tts_model::prep_buffers_and_context: model->backend / model->buffer must be set "
+                  "by the caller (e.g. kokoro_from_file) before setup_from_file in a GPU-only build.");
     }
     size_t ctx_size = ggml_tensor_overhead() * (tensor_meta.n_tensors * size_offset);
     struct ggml_init_params params = {

@@ -38,3 +38,8 @@ __pycache__/
 
 # Installer output
 dist/
+
+build-smoke/
+build/
+src/lemond/build/
+bin/

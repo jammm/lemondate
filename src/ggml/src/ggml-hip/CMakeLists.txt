@@ -62,18 +62,21 @@ file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-mma*.cu")
 list(APPEND GGML_SOURCES_ROCM ${SRCS})
 file(GLOB   SRCS "../ggml-cuda/template-instances/mmq*.cu")
 list(APPEND GGML_SOURCES_ROCM ${SRCS})
-
+# Lemondate: include the mmf (float/half/bf16) matmul template instances
+# koboldcpp's CMakeLists used to glob - upstream llama.cpp ggml-hip
+# forgets these, which leaves mmf.cu with undefined mul_mat_f_cuda<>
+# specialisations at link time.
+file(GLOB   SRCS "../ggml-cuda/template-instances/mmf*.cu")
+list(APPEND GGML_SOURCES_ROCM ${SRCS})
+# Lemondate: full fattn-vec-instance sweep. lld-link fails with
+# "undefined symbol: ggml_cuda_flash_attn_ext_vec_case<D, nk, nv>"
+# when only the three quant-specific subsets are compiled; the full
+# set covers every (D, nk, nv) the switch-case in fattn.cu dispatches
+# to. Matches koboldcpp's jam/gfx1201-hip configuration.
+file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-vec-instance-*.cu")
+list(APPEND GGML_SOURCES_ROCM ${SRCS})
 if (GGML_CUDA_FA_ALL_QUANTS)
-    file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-vec*.cu")
-    list(APPEND GGML_SOURCES_ROCM ${SRCS})
     add_compile_definitions(GGML_CUDA_FA_ALL_QUANTS)
-else()
-    file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-vec*q4_0-q4_0.cu")
-    list(APPEND GGML_SOURCES_ROCM ${SRCS})
-    file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-vec*q8_0-q8_0.cu")
-    list(APPEND GGML_SOURCES_ROCM ${SRCS})
-    file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-vec*f16-f16.cu")
-    list(APPEND GGML_SOURCES_ROCM ${SRCS})
 endif()
 
 ggml_add_backend_library(ggml-hip

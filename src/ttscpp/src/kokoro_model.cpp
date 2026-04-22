@@ -187,7 +187,11 @@ static struct ggml_tensor * build_sin_gen(ggml_context * ctx, kokoro_model * mod
 
     // ggml doesn't support boolean tensors nor does it support greater than and roll ops. As a result, we represent these boolean tensors as 1.0 or 0.0 or simply perform
     // multiplications in place via a custom map.
-    struct ggml_tensor * uv_noise = ggml_map_custom3(ctx, fake, upscaled, kctx->uv_noise_data, &uv_noise_compute, sequence_length, nullptr);
+    // Native GPU op (see ggml_uv_noise / ggml_cuda_op_uv_noise). The old
+    // ggml_map_custom3 path always ran on the CPU backend, which forced the
+    // whole generator subgraph through a GPU->host->GPU bounce per token —
+    // uv_noise_compute() in ttsutil.cpp is still the reference impl.
+    struct ggml_tensor * uv_noise = ggml_uv_noise(ctx, fake, upscaled, kctx->uv_noise_data);
 
 
     struct ggml_tensor * noise = ggml_cont(ctx, ggml_view_2d(ctx, uv_noise, uv_noise->ne[0], uv_noise->ne[1], uv_noise->nb[1], uv_noise->nb[2]));
@@ -1557,7 +1561,9 @@ struct kokoro_duration_context * build_new_duration_kokoro_context(struct kokoro
         kctx->owned_backend    = false;
     }
 #endif
-    kctx->backend_cpu = ggml_backend_cpu_init();
+    // backend_cpu intentionally left null: lemondate builds ggml with
+    // GGML_CPU=OFF so ggml_backend_cpu_init is not linked. The GPU
+    // backend wired above is the sole compute device.
     kctx->set_threads();
     kctx->build_schedule();
     kctx->buf_compute_meta.resize(ggml_tensor_overhead()*model->max_duration_nodes()*5 + ggml_graph_overhead_custom(model->max_duration_nodes()*5, false));
@@ -1574,7 +1580,8 @@ struct kokoro_context * build_new_kokoro_context(struct kokoro_model * model, in
         kctx->owned_backend    = false;
     }
 #endif
-    kctx->backend_cpu = ggml_backend_cpu_init();
+    // backend_cpu intentionally left null: see build_new_duration_
+    // kokoro_context above for the reasoning (GGML_CPU=OFF).
     kctx->set_threads();
     kctx->build_schedule();
     kctx->buf_compute_meta.resize(ggml_tensor_overhead()*model->max_gen_nodes()*30 + ggml_graph_overhead_custom(model->max_gen_nodes()*30, false));

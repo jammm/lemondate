@@ -1246,6 +1246,19 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         for (int b = 0; b < sched->n_backends && *cur_backend_id == -1; b++) {
             ggml_backend_sched_set_if_supported(sched, node, b, cur_backend_id);
         }
+        if (*cur_backend_id == -1) {
+            fprintf(stderr, "\n[lemondate] unsupported op: node %d, op=%s, name=%s\n",
+                i, ggml_op_name(node->op), node->name ? node->name : "(null)");
+            for (int s = 0; s < GGML_MAX_SRC; s++) {
+                struct ggml_tensor * src = node->src[s];
+                if (src) {
+                    fprintf(stderr, "  src[%d]: op=%s, type=%s, dims=[%lld,%lld,%lld,%lld]\n",
+                        s, ggml_op_name(src->op), ggml_type_name(src->type),
+                        (long long)src->ne[0], (long long)src->ne[1],
+                        (long long)src->ne[2], (long long)src->ne[3]);
+                }
+            }
+        }
         GGML_ASSERT(*cur_backend_id != -1);
     }
 

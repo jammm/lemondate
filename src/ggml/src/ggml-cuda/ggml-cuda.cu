@@ -2951,6 +2951,27 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_CUMSUM_TTS:
             ggml_cuda_op_cumsum_tts(ctx, dst);
             break;
+        case GGML_OP_UV_NOISE:
+            ggml_cuda_op_uv_noise(ctx, dst);
+            break;
+        case GGML_OP_STFT:
+            ggml_cuda_op_stft(ctx, dst);
+            break;
+        case GGML_OP_AA_STFT:
+            ggml_cuda_op_aa_stft(ctx, dst);
+            break;
+        case GGML_OP_ISTFT:
+            ggml_cuda_op_istft(ctx, dst);
+            break;
+        case GGML_OP_AA_ISTFT:
+            ggml_cuda_op_aa_istft(ctx, dst);
+            break;
+        case GGML_OP_CONV_TRANSPOSE_1D_TTS:
+            ggml_cuda_op_conv_transpose_1d_tts(ctx, dst);
+            break;
+        case GGML_OP_UPSCALE_LINEAR:
+            ggml_cuda_op_upscale_linear(ctx, dst);
+            break;
         default:
             return false;
     }
@@ -5175,6 +5196,50 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_CUMSUM_TTS:
             return op->src[0]->type == GGML_TYPE_F32 &&
                    op->type == GGML_TYPE_F32 &&
+                   op->src[0]->nb[0] == sizeof(float) &&
+                   op->nb[0] == sizeof(float);
+        case GGML_OP_UV_NOISE:
+            // params (src[2]) is an I32 tensor carrying bit-cast floats;
+            // don't constrain its dtype.
+            return op->type == GGML_TYPE_F32 &&
+                   op->src[0]->type == GGML_TYPE_F32 &&
+                   op->src[1]->type == GGML_TYPE_F32 &&
+                   ggml_is_contiguous(op) &&
+                   ggml_is_contiguous(op->src[1]) &&
+                   ggml_is_contiguous(op->src[2]);
+        case GGML_OP_STFT:
+        case GGML_OP_AA_STFT:
+            // src0 is the time-domain signal, src1 is the window, dst
+            // is the complex (or abs/angle) frame buffer. All F32, and
+            // we rely on ne00 element stride == 1 for the per-thread
+            // DFT loop (batch/frame strides are passed through).
+            return op->type == GGML_TYPE_F32 &&
+                   op->src[0]->type == GGML_TYPE_F32 &&
+                   op->src[1]->type == GGML_TYPE_F32 &&
+                   op->src[0]->nb[0] == sizeof(float) &&
+                   op->src[1]->nb[0] == sizeof(float) &&
+                   op->nb[0] == sizeof(float);
+        case GGML_OP_ISTFT:
+        case GGML_OP_AA_ISTFT:
+            return op->type == GGML_TYPE_F32 &&
+                   op->src[0]->type == GGML_TYPE_F32 &&
+                   op->src[1]->type == GGML_TYPE_F32 &&
+                   op->src[0]->nb[0] == sizeof(float) &&
+                   op->src[1]->nb[0] == sizeof(float) &&
+                   op->nb[0] == sizeof(float);
+        case GGML_OP_CONV_TRANSPOSE_1D_TTS:
+            // Kernel (src0) may be F16 (Kokoro vocoder) or F32; input
+            // activation (src1) and dst are always F32. We handle both
+            // via a templated kernel.
+            return op->type == GGML_TYPE_F32 &&
+                   (op->src[0]->type == GGML_TYPE_F16 || op->src[0]->type == GGML_TYPE_F32) &&
+                   op->src[1]->type == GGML_TYPE_F32 &&
+                   op->src[0]->nb[0] == ggml_type_size(op->src[0]->type) &&
+                   op->src[1]->nb[0] == sizeof(float) &&
+                   op->nb[0] == sizeof(float);
+        case GGML_OP_UPSCALE_LINEAR:
+            return op->type == GGML_TYPE_F32 &&
+                   op->src[0]->type == GGML_TYPE_F32 &&
                    op->src[0]->nb[0] == sizeof(float) &&
                    op->nb[0] == sizeof(float);
 

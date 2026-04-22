@@ -3,7 +3,7 @@
 
 #include "ggml-backend.h"
 #include "ggml-impl.h"
-#include "ggml-cpu-impl.h"
+#include "ggml-cpu/ggml-cpu-impl.h"
 #include "ggml-threading.h"
 #include "ggml-cpu.h"
 #include "ggml.h"
@@ -7987,6 +7987,30 @@ struct ggml_tensor * ggml_upscale_linear(
     result->op     = GGML_OP_UPSCALE_LINEAR;
     result->src[0] = a;
 
+    return result;
+}
+struct ggml_tensor * ggml_uv_noise(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * fake,
+        struct ggml_tensor  * gate,
+        struct ggml_tensor  * params) {
+    // `fake` just carries the output shape ([sequence_length, harmonic_num, 2]).
+    // Its contents are never read by the op; we mirror ttscpp's CPU reference,
+    // which also only used `a` for shape.
+    GGML_ASSERT(fake->type  == GGML_TYPE_F32);
+    GGML_ASSERT(gate->type  == GGML_TYPE_F32);
+    // `params` is declared I32 upstream (ggml_new_tensor_1d with GGML_TYPE_I32),
+    // but its byte contents are bit-cast floats — matches what the CPU reference
+    // reads via `(float *) c->data`. Same layout on x86/RDNA; we only require
+    // that the tensor is contiguous so the CUDA kernel can index it flat.
+    GGML_ASSERT(ggml_is_contiguous(gate));
+    GGML_ASSERT(ggml_is_contiguous(params));
+
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, fake);
+    result->op     = GGML_OP_UV_NOISE;
+    result->src[0] = fake;
+    result->src[1] = gate;
+    result->src[2] = params;
     return result;
 }
 //// end kcpp dirtypatch ////

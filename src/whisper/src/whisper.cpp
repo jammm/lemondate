@@ -1385,15 +1385,20 @@ static buft_list_t make_buft_list(whisper_context_params & params) {
     }
 
     // CPU Extra
+    // lemondate: tolerate GGML_CPU=OFF builds where no CPU device is
+    // registered. Upstream assumes cpu_dev is always non-null, but in
+    // our GPU-only configuration it can legitimately be null.
     auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
-    auto * cpu_reg = ggml_backend_dev_backend_reg(cpu_dev);
-    auto get_extra_bufts_fn = (ggml_backend_dev_get_extra_bufts_t)
-        ggml_backend_reg_get_proc_address(cpu_reg, "ggml_backend_dev_get_extra_bufts");
-    if (get_extra_bufts_fn) {
-        ggml_backend_buffer_type_t * extra_bufts = get_extra_bufts_fn(cpu_dev);
-        while (extra_bufts && *extra_bufts) {
-            buft_list.emplace_back(cpu_dev, *extra_bufts);
-            ++extra_bufts;
+    if (cpu_dev) {
+        auto * cpu_reg = ggml_backend_dev_backend_reg(cpu_dev);
+        auto get_extra_bufts_fn = (ggml_backend_dev_get_extra_bufts_t)
+            ggml_backend_reg_get_proc_address(cpu_reg, "ggml_backend_dev_get_extra_bufts");
+        if (get_extra_bufts_fn) {
+            ggml_backend_buffer_type_t * extra_bufts = get_extra_bufts_fn(cpu_dev);
+            while (extra_bufts && *extra_bufts) {
+                buft_list.emplace_back(cpu_dev, *extra_bufts);
+                ++extra_bufts;
+            }
         }
     }
 

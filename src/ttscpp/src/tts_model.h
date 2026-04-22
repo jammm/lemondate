@@ -14,8 +14,14 @@ struct runner_context {
     runner_context(int n_threads): n_threads(n_threads) {};
     virtual ~runner_context() {
         ggml_backend_sched_free(sched);
-        ggml_threadpool_free(threadpool);
-        ggml_backend_free(backend_cpu);
+        // `backend_cpu` + `threadpool` are dead state in lemondate
+        // (GGML_CPU=OFF). `backend_cpu` is never initialized because
+        // ggml_backend_cpu_init is not linked; `threadpool` likewise
+        // stays null. The fields are preserved to avoid a ripple of
+        // edits across every reader, but the corresponding
+        // ggml_backend_free / ggml_threadpool_free calls would pull
+        // in CPU-backend symbols and are omitted.
+        //
         // Skip freeing `backend` when we don't own it — kokoro shares
         // one CUDA/HIP backend across model + both kctx instances to
         // keep the HIP stream count down to one (multiple
