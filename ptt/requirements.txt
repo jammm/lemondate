@@ -1,0 +1,35 @@
+# PTT daemon + legacy local TTS servers
+#
+# NOTE: torch / torchaudio are NOT pinned here. They are installed
+# separately by install.ps1 from TheRock's ROCm nightly index
+# (https://rocm.nightlies.amd.com/v2/<gfx>/) together with
+# `rocm[libraries,devel]`. Listing them here would pull the upstream
+# CUDA/CPU wheel from PyPI and clobber the ROCm build.
+
+# HTTP to lemonade's /audio/transcriptions (and TTS) endpoints
+requests>=2.31.0
+
+# Global F9 hotkey + synthetic typing into the focused window
+pynput>=1.7.6
+pyautogui>=0.9.54
+
+# Mic capture + WAV encoding + array math
+numpy>=1.26.0
+sounddevice>=0.4.6
+soundfile>=0.12.1
+
+# Foreground-window / process introspection (window_check.py uses
+# ctypes for the WinAPI calls, psutil for the process tree walk)
+psutil>=5.9.0
+
+# FastAPI servers for the legacy A/B local TTS path
+# (f5_tts_server.py, kokoro_server.py). Not on the default hot path
+# but still imported when those scripts are invoked directly.
+fastapi>=0.110.0
+uvicorn>=0.30.0
+pydantic>=2.6.0
+
+# TTS model backends used by the legacy servers. These pull in
+# transformers / accelerate / einops / etc. as transitive deps.
+f5-tts
+kokoro>=0.9.4
