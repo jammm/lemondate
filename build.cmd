@@ -162,9 +162,28 @@ echo.
 echo [lemondate] === Staging bin\ ===
 if not exist "%CD%\bin" mkdir "%CD%\bin"
 
-if exist "%BUILD_DIR%\bin\whisper-server.exe"     copy /y "%BUILD_DIR%\bin\whisper-server.exe" "%CD%\bin\" >nul
-if exist "%BUILD_DIR%\bin\kokoro-hip-server.exe"  copy /y "%BUILD_DIR%\bin\kokoro-hip-server.exe" "%CD%\bin\" >nul
+REM copy /y silently succeeds-with-exit-1 when the destination is locked
+REM (another process is running it), which used to leave a stale binary in
+REM bin\ while the build log claimed success. Check the exit code and abort
+REM loudly so the user knows to stop services before re-staging.
+set _stage_failed=0
+if exist "%BUILD_DIR%\bin\whisper-server.exe" (
+    copy /y "%BUILD_DIR%\bin\whisper-server.exe" "%CD%\bin\" >nul
+    if errorlevel 1 set _stage_failed=1
+)
+if exist "%BUILD_DIR%\bin\kokoro-hip-server.exe" (
+    copy /y "%BUILD_DIR%\bin\kokoro-hip-server.exe" "%CD%\bin\" >nul
+    if errorlevel 1 set _stage_failed=1
+)
 for %%F in ("%BUILD_DIR%\bin\*.dll") do copy /y "%%F" "%CD%\bin\" >nul 2>&1
+if "%_stage_failed%"=="1" (
+    echo.
+    echo [lemondate] ERROR: staging to bin\ failed - a target binary is
+    echo             likely locked by a running process. Stop services
+    echo             (tts_tts_claude_code\installers\stop_services.ps1)
+    echo             then re-run build.cmd.
+    goto :fail
+)
 
 REM lemond's CMake outputs: lemond.exe at build root, other exes at build\Release\
 if exist "%LEMOND_BUILD%\lemond.exe"                copy /y "%LEMOND_BUILD%\lemond.exe"                "%CD%\bin\" >nul

@@ -1008,7 +1008,18 @@ bool phonemizer::handle_punctuation(corpus* text, std::string next, std::string*
 		} else if (after[0] == '-') {
 			//flags->pre_pause += 4;
 			text->pop(2);
-			output->append(" ");
+			// Only emit a space if we don't already have one. The
+			// em-dash path is reached after pre-processing (";", ":",
+			// "\n", and " - " are all normalised to "--"), so the
+			// preceding handle_space() call has usually left a space
+			// in the output already. Appending another produces a
+			// double space the Kokoro tokenizer maps to a phantom
+			// pause-token the model wasn't trained for — and it
+			// hallucinates a filler word (commonly "euros") into
+			// the gap.
+			if (output->empty() || output->back() != ' ') {
+				output->append(" ");
+			}
 			flags->reset_for_space();
 			return true;
 		} else if (!flags->beginning_of_clause && flags->was_word && is_alphabetic(after[0])) {

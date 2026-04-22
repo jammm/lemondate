@@ -1467,6 +1467,8 @@ static void kokoro_str_replace_all(std::string & s, const std::string & search, 
 }
 
 int kokoro_runner::generate(std::string prompt, struct tts_response * response, std::string voice, std::string voice_code) {
+	fprintf(stderr, "[kokoro-gen-entry] prompt=<<%s>> voice=<<%s>>\n", prompt.c_str(), voice.c_str());
+	fflush(stderr);
 	if (model->voices.find(voice) == model->voices.end()) {
 		fprintf(stdout,"\nFailed to find Kokoro voice '%s' aborting.\n", voice.c_str());
 		return -1;
@@ -1494,7 +1496,27 @@ int kokoro_runner::generate(std::string prompt, struct tts_response * response, 
 	kokoro_str_replace_all(prompt,"n't ","nt ");
 	kokoro_str_replace_all(prompt,"*"," ");
   	std::string phonemized_prompt = phmzr->text_to_phonemes(prompt);
-	// printf("\nRESULT: %s\n",phonemized_prompt.c_str());
+	// Belt-and-suspenders: collapse any remaining runs of spaces in the
+	// phonemized output down to a single space. The em-dash path in the
+	// phonemizer has been fixed to avoid emitting duplicates, but the
+	// preprocessing still routes ";", ":", "\n", and " - " through that
+	// path and anything else upstream (or future edits) could reintroduce
+	// doubles that the model then hallucinates a filler word into.
+	{
+		std::string collapsed;
+		collapsed.reserve(phonemized_prompt.size());
+		bool last_space = false;
+		for (char c : phonemized_prompt) {
+			if (c == ' ') {
+				if (!last_space) collapsed.push_back(' ');
+				last_space = true;
+			} else {
+				collapsed.push_back(c);
+				last_space = false;
+			}
+		}
+		phonemized_prompt = std::move(collapsed);
+	}
 
   	// Kokoro users a utf-8 single character tokenizer so if the size of the prompt is smaller than the max context length without the
   	// beginning of sentence and end of sentence tokens then we can compute it all at once.
