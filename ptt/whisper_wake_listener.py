@@ -149,15 +149,27 @@ class WhisperWakeListener:
                     if rms < config.EOU_ENERGY_THRESHOLD:
                         continue
 
-                    # Energy crossed threshold — start recording. The
-                    # recorder's VAD endpoint will stop it on silence.
-                    # recorder.start handles re-entry, so if something
-                    # else just started it we'll quietly lose this
-                    # frame.
-                    if not self.recorder.start(source="whisper_wake", vad_endpoint=True):
+                    # Energy crossed threshold — start recording. Seed
+                    # with the rolling prebuffer snapshot so the word
+                    # onset (which preceded the threshold crossing by
+                    # ~a frame or two) isn't clipped. Without this,
+                    # "hey halo what time" commonly transcribes as
+                    # "halo what time" and fails the WAKE_PHRASE regex.
+                    prebuffer = None
+                    with self._prebuffer_lock:
+                        if self._prebuffer:
+                            prebuffer = np.concatenate(list(self._prebuffer)).astype(
+                                np.int16, copy=False,
+                            )
+                    if not self.recorder.start(
+                        source="whisper_wake",
+                        vad_endpoint=True,
+                        prebuffer=prebuffer,
+                    ):
                         continue
-                    # Seed this frame into the buffer so the first sound
-                    # isn't lost.
+                    # Also feed the current frame — the one whose RMS
+                    # tripped the gate — so it's counted in the VAD
+                    # silence window.
                     self.recorder.feed(frame)
                     self._last_fire = time.monotonic()
         except Exception:

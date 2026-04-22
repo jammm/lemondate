@@ -67,40 +67,58 @@ class PTTKeyHandler:
         self._target_key = _parse_hotkey(config.PTT_HOTKEY)
 
     def on_press(self, key) -> None:
-        if self._is_target(key) and not self._held:
-            self._held = True
-            if not focus_passes_gate():
-                log.info("PTT suppressed: focus is %s", describe_current_focus())
-                return
+        if not self._is_target(key) or self._held:
+            return
+        if not focus_passes_gate():
+            log.info("PTT suppressed: focus is %s", describe_current_focus())
+            return
 
-            prebuffer = None
-            if self._wake_listener is not None:
-                prebuffer = self._wake_listener.get_prebuffer()
-                # Prevent wake path from firing on PTT tail audio after
-                # release — it shares the same mic stream.
-                self._wake_listener.note_external_fire()
+        # If the wake listener just fired a recording on ambient noise,
+        # drop it — a direct F9 press is a stronger intent signal than
+        # energy crossing the VAD threshold, and letting wake run to
+        # completion would both delay the PTT response and consume
+        # whatever the user is saying right now.
+        if self.recorder.is_recording():
+            log.info("PTT preempting in-progress wake recording")
+            self.recorder.abort()
 
-            if not self.recorder.start(
-                source="ptt",
-                vad_endpoint=False,
-                prebuffer=prebuffer,
-            ):
-                return
+        prebuffer = None
+        if self._wake_listener is not None:
+            prebuffer = self._wake_listener.get_prebuffer()
+            # Keep wake quiet for WAKE_COOLDOWN_SECONDS after release so
+            # it doesn't re-fire on the tail of the PTT utterance.
+            self._wake_listener.note_external_fire()
 
-            # Wake listener's main loop will feed subsequent frames
-            # while recorder.is_recording(). Only open a dedicated
-            # stream when it isn't running.
-            if self._wake_listener is None:
-                self._open_stream()
+        if not self.recorder.start(
+            source="ptt",
+            vad_endpoint=False,
+            prebuffer=prebuffer,
+        ):
+            log.warning("PTT keydown: recorder.start failed")
+            return
+
+        # Only set _held AFTER start succeeds so on_release doesn't
+        # fire stop() on someone else's recording if we failed here.
+        self._held = True
+        log.info("PTT keydown: recording (prebuffer=%s frames)",
+                 "0" if prebuffer is None else prebuffer.size // config.CHUNK_SAMPLES)
+
+        # Wake listener's main loop will feed subsequent frames while
+        # recorder.is_recording(). Only open a dedicated stream when
+        # --no-wake leaves us without a shared stream.
+        if self._wake_listener is None:
+            self._open_stream()
 
     def on_release(self, key) -> None:
-        if self._is_target(key) and self._held:
-            self._held = False
-            self._close_stream()
-            self.recorder.stop()
         if _is_quit_combo(key):
             log.info("Esc+Esc: requesting shutdown")
             self.stop_event.set()
+        if not self._is_target(key) or not self._held:
+            return
+        self._held = False
+        self._close_stream()
+        log.info("PTT keyup: stopping")
+        self.recorder.stop()
 
     def _is_target(self, key) -> bool:
         return key == self._target_key

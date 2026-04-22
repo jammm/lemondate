@@ -110,6 +110,23 @@ class Recorder:
         # Drop the lock before calling stop() to avoid nested-acquire.
         self.stop()
 
+    def abort(self) -> None:
+        """Drop the current recording's buffer without transcribing.
+        Used by PTT to preempt an in-progress wake recording — user's
+        F9 press is a direct intent and should take priority over
+        whatever the wake listener happened to start on ambient
+        noise."""
+        with self._lock:
+            if not self._recording:
+                return
+            source = self._source
+            samples = sum(b.size for b in self._buffer)
+            self._buffer = []
+            self._recording = False
+            self._source = None
+            self._vad_endpoint = False
+        log.info("recorder aborted (source=%s, dropped %d samples)", source, samples)
+
     def stop(self) -> None:
         with self._lock:
             if not self._recording:
