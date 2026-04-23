@@ -11,7 +11,13 @@ from pathlib import Path
 
 # 127.0.0.1 not localhost — see speak.py for the Windows IPv6-fallback note.
 LEMONADE_URL = os.environ.get("LEMONADE_URL", "http://127.0.0.1:13305")
-TRANSCRIBE_ENDPOINT = f"{LEMONADE_URL}/api/v1/audio/transcriptions"
+# When running against a bare whisper-server (e.g. the NPU build from
+# amd/whisper.cpp), set TRANSCRIBE_ENDPOINT to its /inference URL.
+# Default is lemond's OpenAI-compatible path.
+TRANSCRIBE_ENDPOINT = os.environ.get(
+    "TRANSCRIBE_ENDPOINT",
+    f"{LEMONADE_URL}/api/v1/audio/transcriptions",
+)
 
 # Whisper-Large-v3-Turbo: ~800 M params distilled from Large-v3. Near-Large
 # accuracy at ~Medium speed. Whisper-Small mishears technical English

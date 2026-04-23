@@ -207,12 +207,12 @@ class Recorder:
             return
         log.info("typing: %r (auto_submit=%s)", text, config.PTT_AUTO_SUBMIT)
         try:
-            # Trailing space then Enter: the space gives apps with
-            # trailing-newline sensitivity (e.g. shells with
-            # completion menus) a chance to flush the autocomplete
-            # list before the submit arrives. Skipped when
-            # PTT_AUTO_SUBMIT=0 so the user can review before sending.
-            pyautogui.typewrite(text + " ", interval=0.005)
+            # Clipboard paste (Ctrl+V) — faster than typewrite and
+            # handles Unicode. pyperclip is already a pyautogui dep.
+            import pyperclip
+            pyperclip.copy(text)
+            time.sleep(0.03)
+            pyautogui.hotkey("ctrl", "v")
             if config.PTT_AUTO_SUBMIT:
                 time.sleep(0.05)
                 pyautogui.press("enter")
