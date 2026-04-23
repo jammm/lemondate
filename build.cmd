@@ -205,8 +205,11 @@ REM Fall through silently if the install path differs.
 if exist "C:\Strawberry\c\bin\zlib1__.dll"     copy /y "C:\Strawberry\c\bin\zlib1__.dll"     "%CD%\bin\" >nul 2>&1
 if exist "C:\Strawberry\c\bin\libssh2-1__.dll" copy /y "C:\Strawberry\c\bin\libssh2-1__.dll" "%CD%\bin\" >nul 2>&1
 
-REM rocFFT runtime (needed by ggml-hip for the ttscpp STFT/ISTFT path)
-if exist "%ROCM_ROOT%\bin\rocfft.dll" copy /y "%ROCM_ROOT%\bin\rocfft.dll" "%CD%\bin\" >nul 2>&1
+REM rocFFT, hipBLAS, rocBLAS etc. are resolved at runtime from the
+REM ROCm SDK's bin/ directory (via `rocm-sdk path --root`/bin on PATH).
+REM The run_lemond.ps1 shim prepends this path automatically, so we
+REM do NOT copy ROCm DLLs into bin\ — that caused version-skew bugs
+REM when switching between gfx1201 and gfx1151 venvs.
 
 REM Kokoro IPA override dictionary — 65k entries that get hit BEFORE the
 REM rule-based phonemizer's buggy cascade, fixing most `-es` plural /
