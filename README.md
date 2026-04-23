@@ -60,6 +60,26 @@ Python daemon in [ptt/](ptt/). Provisions its own venv inside `lemondate/`:
 
 See [ptt/README.md](ptt/README.md) for runtime details.
 
+## Strix Halo / XDNA 2 NPU deployment
+
+For Ryzen AI Max / Max+ laptops the NPU migration is split into two
+phases:
+
+- **Phase 1 (shipping on the `strix-halo-npu` branch):** Whisper STT
+  on the **XDNA 2 NPU**, Kokoro TTS on the **gfx1151 iGPU**. Full
+  setup (driver + Ryzen AI 1.7.1 + FlexML runtime + runtime env vars)
+  in [docs/strix-halo.md](docs/strix-halo.md).
+- **Phase 2 (future):** Kokoro TTS on the NPU as well, iGPU fully
+  freed for LLM / rendering / other work. No partial ports, no iGPU
+  fallback — the plan is in [docs/kokoro-npu-future.md](docs/kokoro-npu-future.md).
+  Phase 2 starts only after Phase 1 is production-solid.
+
+Quick readiness check on a Strix Halo host:
+
+```powershell
+.\scripts\detect_npu.ps1
+```
+
 ## Consumers
 
 - [jammm/tts_tts_claude_code](https://github.com/jammm/tts_tts_claude_code) -- the Claude Code plugin, installer, and service shims. Its installer takes `-LemondatePath` pointing at this repo's built install tree and wires up the F9 hotkey + wake word + Stop-hook TTS.
