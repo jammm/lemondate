@@ -20,16 +20,23 @@ lemondate/
 ## Build
 
 Prereqs:
-- Windows 11 (tested on gfx1201 / RX 9070 XT; gfx1151 / Strix Halo supported)
+- Windows 11 (tested on gfx1201 / RX 9070 XT; gfx1151 / Strix Halo iGPU)
 - VS 2022 x64 developer environment
-- Python 3.12 venv with TheRock ROCm SDK:
+- Python 3.12 venv with TheRock ROCm SDK. Use the pip index for your
+  GPU — each ships matching hipBLASLt / rocBLAS kernel libraries:
+
+  | GPU | pip index |
+  |---|---|
+  | RX 9070 / XT (gfx1201) | `https://rocm.nightlies.amd.com/v2/gfx120X-all/` |
+  | Strix Halo iGPU (gfx1151) | `https://rocm.nightlies.amd.com/v2/gfx1151/` |
+  | RX 7900 XTX (gfx1100) | `https://rocm.nightlies.amd.com/v2/gfx110X-all/` |
+
   ```powershell
   python -m venv .venv
   .\.venv\Scripts\Activate.ps1
-  pip install --index-url https://rocm.nightlies.amd.com/v2/gfx120X-all/ torch "rocm[libraries,devel]"
+  pip install --index-url <your-index> torch "rocm[libraries,devel]"
   rocm-sdk init
   ```
-  For Strix Halo, swap `gfx120X-all` for `gfx1151` in the index URL.
 
 Then:
 
@@ -38,15 +45,19 @@ Then:
 ```
 
 Artefacts land in `bin\`:
-- `lemond.exe` / `lemonade.exe` -- HTTP orchestrator
-- `whisper-server.exe` -- ROCm STT (spawned by lemond on demand)
-- `kokoro-hip-server.exe` -- HIP Kokoro TTS (spawned by lemond on demand)
+- `lemond.exe` / `lemonade.exe` — HTTP orchestrator
+- `whisper-server.exe` — ROCm STT (spawned by lemond on demand)
+- `kokoro-hip-server.exe` — HIP Kokoro TTS (spawned by lemond on demand)
+
+ROCm runtime DLLs (hipblas, rocblas, rocfft, hiprtc, etc.) are **not**
+copied into `bin\` — they resolve at runtime from the venv's ROCm SDK
+via `rocm-sdk path --root`/bin on PATH. The `run_lemond.ps1` shim
+sets this up automatically.
 
 To re-target a different GPU:
 
 ```powershell
 $env:GFX_TARGET = "gfx1151"          # Strix Halo iGPU
-# or "gfx1151;gfx1201" for a fat binary
 .\build.cmd
 ```
 
@@ -62,22 +73,30 @@ See [ptt/README.md](ptt/README.md) for runtime details.
 
 ## Strix Halo / XDNA 2 NPU deployment
 
-For Ryzen AI Max / Max+ laptops the NPU migration is split into two
-phases:
+Validated on Ryzen AI Max+ 395 (Strix Halo): Whisper Large-v3-Turbo
+on the XDNA 2 NPU at **RTF 0.105** (10x real-time), Kokoro TTS on
+the gfx1151 iGPU at **0.41s warm**.
 
-- **Phase 1 (shipping on the `strix-halo-npu` branch):** Whisper STT
-  on the **XDNA 2 NPU**, Kokoro TTS on the **gfx1151 iGPU**. Full
-  setup (driver + Ryzen AI 1.7.1 + FlexML runtime + runtime env vars)
-  in [docs/strix-halo.md](docs/strix-halo.md).
-- **Phase 2 (future):** Kokoro TTS on the NPU as well, iGPU fully
-  freed for LLM / rendering / other work. No partial ports, no iGPU
-  fallback — the plan is in [docs/kokoro-npu-future.md](docs/kokoro-npu-future.md).
-  Phase 2 starts only after Phase 1 is production-solid.
+- **Phase 1 (working):** Whisper STT on the **XDNA 2 NPU** (via
+  AMD's `amd/whisper.cpp` VitisAI fork), Kokoro TTS on the
+  **gfx1151 iGPU**. Full setup in [docs/strix-halo.md](docs/strix-halo.md).
+- **Phase 2 (blocked):** Kokoro TTS on the NPU is not possible with
+  Ryzen AI SDK 1.7.1 — the VitisAI EP only supports CNN INT8 on STX
+  hardware. The compiler produces valid AIE2P code but the runtime
+  rejects the HW context. Details in [docs/kokoro-npu-future.md](docs/kokoro-npu-future.md).
 
 Quick readiness check on a Strix Halo host:
 
 ```powershell
 .\scripts\detect_npu.ps1
+```
+
+For standalone PTT testing (no lemond needed — just whisper-server +
+PTT daemon):
+
+```powershell
+$env:TRANSCRIBE_ENDPOINT = "http://127.0.0.1:13305/inference"
+$env:PTT_REQUIRE_APPS = "any"   # types into any focused window
 ```
 
 ## Consumers
@@ -95,4 +114,7 @@ lemondate is a vendored fusion of:
 Our additions on top:
 - Kokoro-on-HIP correctness fixes: 128-byte tensor alignment, `reciprocal` kernel rewrite, staging-buffer `set_inputs`, shared backend instance.
 - Fused `snake_1d` megakernel + CUDA kernels for the `ttscpp` custom ops (mod / cumsum_tts / ttsround / reciprocal / upscale_linear / conv_transpose_1d_tts / stft / istft) so the Kokoro graph runs entirely on the GPU.
+- STFT/ISTFT/CONCAT kernel grid.y tiling to handle TTS output >13.6s without crashing HIP's 65535-block-per-dim limit.
 - `ROCBLAS_USE_HIPBLASLT=1` baked into the server startup so F32 matmuls go through hipBLASLt (7x speedup on gfx1201).
+- SIGABRT / SIGSEGV / SEH crash handlers + MiniDumpWriteDump for post-mortem debugging.
+- 65k-entry `kokoro_ipa.embd` phonemizer override dictionary (from koboldcpp) + `/phonemize` debug endpoint for triaging mispronunciations.

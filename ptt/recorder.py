@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import io
 import logging
+import os
 import re
 import threading
 import time
@@ -207,12 +208,20 @@ class Recorder:
             return
         log.info("typing: %r (auto_submit=%s)", text, config.PTT_AUTO_SUBMIT)
         try:
-            # Clipboard paste (Ctrl+V) — faster than typewrite and
-            # handles Unicode. pyperclip is already a pyautogui dep.
-            import pyperclip
-            pyperclip.copy(text)
-            time.sleep(0.03)
-            pyautogui.hotkey("ctrl", "v")
+            if os.environ.get("PTT_USE_CLIPBOARD"):
+                # Clipboard paste — faster, handles Unicode, but
+                # overwrites the clipboard and needs Ctrl+V (not
+                # Ctrl+Shift+V). Used for standalone testing without
+                # Claude Code (set PTT_USE_CLIPBOARD=1).
+                import pyperclip
+                pyperclip.copy(text)
+                time.sleep(0.03)
+                pyautogui.hotkey("ctrl", "v")
+            else:
+                # typewrite: types char-by-char. Slower but doesn't
+                # touch the clipboard and works reliably in terminals
+                # (Claude Code, Windows Terminal, etc.).
+                pyautogui.typewrite(text + " ", interval=0.005)
             if config.PTT_AUTO_SUBMIT:
                 time.sleep(0.05)
                 pyautogui.press("enter")
